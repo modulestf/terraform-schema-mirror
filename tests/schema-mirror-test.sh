@@ -336,8 +336,8 @@ fail_fast() { sed 's/fail-fast: false/fail-fast: true/'; }
 wide_parallel() { sed 's/"\$MAX_PARALLEL" =~ ^\[1-6\]\$/"$MAX_PARALLEL" =~ ^[0-9]+$/'; }
 # shellcheck disable=SC2016 # workflow text, not shell
 other_matrix() { sed 's/include: \${{ fromJSON(needs.plan.outputs.matrix) }}/include: ${{ fromJSON(inputs.matrix) }}/'; }
-no_recheck_build() { awk -v c="$MATRIX_CHECK" '$0 == "          " c && !done { done = 1; next } { print }'; }
-no_recheck_publish() { awk -v c="$MATRIX_CHECK" '$0 == "          " c && ++n == 2 { next } { print }'; }
+no_recheck_build() { C="$MATRIX_CHECK" awk 'BEGIN { c = ENVIRON["C"] } ''$0 == "          " c && !done { done = 1; next } { print }'; }
+no_recheck_publish() { C="$MATRIX_CHECK" awk 'BEGIN { c = ENVIRON["C"] } ''$0 == "          " c && ++n == 2 { next } { print }'; }
 no_notice_upload() { sed 's/for f in "\$tarball" manifest.json NOTICE SHA256SUMS; do/for f in "$tarball" manifest.json SHA256SUMS; do/'; }
 long_timeout() { sed -E 's/^    timeout-minutes: 240$/    timeout-minutes: 400/'; }
 close_step_timeout() { sed -E 's/^        timeout-minutes: *[0-9]+$/        timeout-minutes: 230/'; }

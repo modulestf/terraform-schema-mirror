@@ -84,7 +84,7 @@ Open a pull request that adds a line to [ci/mirror/providers.txt](ci/mirror/prov
 
 ## Tests
 
-Run `bash tests/schema-mirror-test.sh` from the repository root; it needs bash, jq, tar, gzip and sha256sum, and makes no network call. It checks the publisher workflow's invariants (triggers, permissions, pinned actions, token scope, draft-then-publish releases, run caps) and mutates temp copies to confirm each check catches a break, then runs `ci/mirror/build.sh` against a stubbed registry and checks the bundle it writes. The same test runs on every pull request and push to `main`.
+Run `bash tests/schema-mirror-test.sh` from the repository root; it needs bash, jq, tar, gzip and sha256sum, and makes no network call. It checks the publisher workflow's invariants (triggers, permissions, pinned actions, token scope, draft-then-publish releases, run caps) and mutates temp copies to confirm each check catches a break, then runs `ci/mirror/build.sh` against a stubbed registry and checks the bundle it writes. The same test runs on every pull request and push to `master`.
 
 ## License
 

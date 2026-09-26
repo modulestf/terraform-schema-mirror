@@ -1,0 +1,168 @@
+# Provider schema mirror: the publisher workflow.
+#
+# Copied from a template kept with the review workflows; change it there first so the two
+# stay the same. This repository must stay public: consumers download its release assets
+# anonymously.
+#
+# It publishes one release per provider version: a tar.gz of every resource and data
+# source page from the Terraform registry, manifest.json, NOTICE and SHA256SUMS. The
+# providers and pinned floor versions are listed in ci/mirror/providers.txt. A version
+# whose tag exists is skipped: pages at a version never change, so a release is built
+# once and never rebuilt. A version with any failed page is not published this run; the
+# next run retries it. How it works and why: README.md.
+#
+# It runs only on schedule and workflow_dispatch, only on the default branch. The job
+# holds contents: write, to create releases, and nothing else: no secret beyond
+# GITHUB_TOKEN, no id-token, no cloud credential and no model. The checkout step receives
+# the token to clone and does not persist it; after that only the publish step gets it.
+#
+# Items marked [verify] are assumptions the first live run must confirm.
+
+name: provider schema mirror
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      minor_lines:
+        description: 'How many of the latest minor lines to mirror per provider (1-10)'
+        required: false
+        default: '3'
+
+permissions: {}
+
+jobs:
+  publish:
+    # A schedule run is always on the default branch; a manual run must be too, so that
+    # only reviewed code in ci/mirror/ ever publishes. [verify]
+    if: github.event_name == 'schedule' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    # About 0.8 s per page at MIRROR_DELAY 0.5. The build step starts no new version after
+    # DEADLINE_MINUTES, and one version takes at most about 70 minutes at the
+    # MIRROR_MAX_PAGES cap, which leaves time to publish before this timeout. [verify]
+    timeout-minutes: 350
+    permissions:
+      contents: write
+    concurrency:
+      group: schema-mirror-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      MINOR_LINES: ${{ inputs.minor_lines || '3' }}
+      # Seconds between registry calls; one call at a time.
+      MIRROR_DELAY: '0.5'
+      # The most pages one version may have; a version with more is not built.
+      MIRROR_MAX_PAGES: '5000'
+      # The most pages one run fetches, failed builds included; the versions past it wait
+      # for the next run.
+      MAX_RUN_PAGES: '12000'
+      # No new version starts after this many minutes of the build step.
+      DEADLINE_MINUTES: '240'
+      # Sent to the registry with every call, so its operators can tell who reads in bulk.
+      MIRROR_USER_AGENT: provider-schema-mirror (github.com/${{ github.repository }})
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      # No token in this step. The tag list is read anonymously from the public host
+      # repository. Each version is built by ci/mirror/build.sh into its own directory,
+      # which exists only when the whole build succeeded.
+      - name: Build the bundles
+        run: |
+          set -uo pipefail
+          set -f
+          out="$RUNNER_TEMP/mirror-out"
+          built="$RUNNER_TEMP/mirror-built"
+          tags="$RUNNER_TEMP/mirror-tags"
+          mkdir "$out" || exit 1
+          : > "$built"
+          [[ "$MINOR_LINES" =~ ^[0-9]{1,2}$ ]] && [ "$MINOR_LINES" -ge 1 ] && [ "$MINOR_LINES" -le 10 ] \
+            || { echo "::error::minor_lines must be a number from 1 to 10"; exit 1; }
+          [[ "$MAX_RUN_PAGES" =~ ^[0-9]{1,6}$ && "$MIRROR_MAX_PAGES" =~ ^[0-9]{1,6}$ && "$DEADLINE_MINUTES" =~ ^[0-9]{1,3}$ ]] \
+            || { echo "::error::bad page caps or deadline"; exit 1; }
+          git ls-remote --tags --refs "https://github.com/$GITHUB_REPOSITORY.git" | sed -n 's|^[0-9a-f]*[[:space:]]*refs/tags/||p' > "$tags" \
+            || { echo "::error::cannot list the tags of the host repository"; exit 1; }
+          budget="$MAX_RUN_PAGES"
+          deadline=$((SECONDS + DEADLINE_MINUTES * 60))
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%%#*}"
+            read -r pr floors <<< "$line"
+            [ -n "${pr:-}" ] || continue
+            # shellcheck disable=SC2086 # floors is a list of versions; globbing is off
+            vers="$(ci/mirror/build.sh select "$pr" "$MINOR_LINES" $floors)" || { echo "::warning::no versions for $pr; skipped"; continue; }
+            for ver in $vers; do
+              # "_" joins namespace and name: neither may hold one, so a tag names one provider.
+              tag="${pr/\//_}-v$ver"
+              grep -qxF -- "$tag" "$tags" && continue
+              [ "$budget" -gt 0 ] || { echo "::notice::the run cap of $MAX_RUN_PAGES pages is reached; the rest wait for the next run"; break 2; }
+              [ "$SECONDS" -lt "$deadline" ] || { echo "::notice::the deadline of $DEADLINE_MINUTES minutes is reached; the rest wait for the next run"; break 2; }
+              cap="$MIRROR_MAX_PAGES"
+              [ "$budget" -lt "$cap" ] && cap="$budget"
+              pages="$(MIRROR_MAX_PAGES="$cap" ci/mirror/build.sh build "$pr" "$ver" "$out/$tag")"
+              rc=$?
+              # build.sh prints the pages it fetched, on failure too: every fetch counts.
+              [[ "$pages" =~ ^[0-9]{1,6}$ ]] || pages=0
+              budget=$((budget - pages))
+              if [ "$rc" = 0 ]; then
+                printf '%s %s %s\n' "$tag" "$pr" "$ver" >> "$built"
+                echo "built $tag: $pages pages"
+              else
+                echo "::warning::$tag was not built after $pages page fetches; the next run retries it"
+              fi
+            done
+          done < ci/mirror/providers.txt
+          echo "versions built: $(wc -l < "$built")"
+
+      # Each release is created as a draft, its assets uploaded, and only then published,
+      # which creates the tag. A release whose upload or publish fails is deleted while it
+      # is still a draft, so a partial release is never visible. REST only, with the job's
+      # GITHUB_TOKEN.
+      - name: Publish the releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          set -f
+          out="$RUNNER_TEMP/mirror-out"
+          built="$RUNNER_TEMP/mirror-built"
+          rc=0
+          while read -r tag pr ver; do
+            d="$out/$tag"
+            tarball="${pr/\//_}-$ver.tar.gz"
+            (cd "$d" && sha256sum --strict --quiet -c SHA256SUMS) || { echo "::error::$tag: checksums do not match"; rc=1; continue; }
+            body="$(printf '%s\n' \
+              "Documentation pages of the Terraform provider $pr, version $ver, as served by the Terraform registry:" \
+              "https://registry.terraform.io/v1/providers/$pr/$ver" \
+              "" \
+              "The provider documentation is licensed by its authors under the Mozilla Public License 2.0 (MPL-2.0):" \
+              "https://mozilla.org/MPL/2.0/. The pages are unmodified; the source is the provider's own repository." \
+              "" \
+              "Assets: $tarball (the pages), manifest.json, NOTICE, SHA256SUMS. See README.md in the host repository.")"
+            id="$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$tag" -f target_commitish="$GITHUB_SHA" \
+              -f name="$pr $ver" -f body="$body" -F draft=true -f make_latest=false --jq .id)" \
+              && [[ "$id" =~ ^[0-9]+$ ]] || { echo "::error::$tag: cannot create the draft release"; rc=1; continue; }
+            ok=1
+            for f in "$tarball" manifest.json NOTICE SHA256SUMS; do
+              # [verify] gh api accepts the absolute uploads URL
+              gh api -X POST "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$id/assets?name=$f" \
+                -H 'Content-Type: application/octet-stream' --input "$d/$f" > /dev/null || { ok=0; break; }
+            done
+            if [ "$ok" = 1 ] && gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$id" -F draft=false -f make_latest=false > /dev/null; then
+              echo "published $tag"
+              continue
+            fi
+            rc=1
+            # Delete only a draft: a publish that failed on the way back may have gone through.
+            draft="$(gh api "repos/$GITHUB_REPOSITORY/releases/$id" --jq .draft)"
+            if [ "$draft" = true ]; then
+              echo "::error::$tag: the upload or publish failed; the draft is deleted and the next run retries it"
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id" > /dev/null || echo "::error::$tag: delete the draft release $id by hand"
+            elif [ -z "$draft" ]; then
+              echo "::error::$tag: the upload or publish failed and release $id cannot be read back; check it by hand"
+            else
+              echo "::error::$tag: the publish reported a failure but release $id is not a draft; check it by hand"
+            fi
+          done < "$built"
+          exit "$rc"

@@ -1,0 +1,15 @@
+# Providers the schema mirror publishes. One provider per line: <namespace>/<name>, then
+# any pinned floor versions, separated by spaces. Text after # is a comment.
+#
+# Each run publishes the newest patch of the latest minor lines of each provider (three
+# by default), plus every floor version listed here that the registry has. A floor is
+# a version that module constraints still start from, such as the lowest version a
+# widely used module family supports.
+#
+# To add a provider, add a line, for example:
+#   hashicorp/random
+#   hashicorp/google 6.0.0
+# List only providers whose documentation is licensed under MPL-2.0: the release notes
+# state that license. The first run of a large provider fetches its pages for several
+# versions; the run cap in the workflow spreads that over more than one run.
+hashicorp/aws 5.46.0 6.0.0

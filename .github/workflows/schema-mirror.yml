@@ -1,0 +1,220 @@
+# Provider schema mirror: the publisher workflow.
+#
+# Copied from a template kept with the review workflows; change it there first so the two
+# stay the same. This repository must stay public: consumers download its release assets
+# anonymously.
+#
+# It publishes one release per provider version: a tar.gz of every resource and data
+# source page from the Terraform registry, manifest.json, NOTICE and SHA256SUMS. Every
+# stable version of each provider in ci/mirror/providers.txt is published, newest first,
+# optionally from a minimum version up. A version whose tag exists is skipped: pages at a
+# version never change, so a release is built once and never rebuilt. A version with any
+# failed page is not published this run; the next run retries it. How it works and why:
+# README.md.
+#
+# Two jobs. plan holds contents: read and no token beyond the checkout's: it lists the
+# existing tags anonymously, picks the versions to build and hands them to build as a
+# matrix. build runs one job per version, at most max_parallel at a time, and holds
+# contents: write to create releases. Neither holds a secret beyond GITHUB_TOKEN, an
+# id-token, a cloud credential or a model. Each checkout step receives the token to clone
+# and does not persist it; after that only the publish step gets it.
+#
+# It runs only on schedule and workflow_dispatch, only on the default branch.
+#
+# Items marked [verify] are assumptions the first live run must confirm.
+
+name: provider schema mirror
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      max_versions:
+        description: 'The most versions one run builds, over all providers (1-250)'
+        required: false
+        default: '40'
+      max_parallel:
+        description: 'The most versions built at the same time (1-6)'
+        required: false
+        default: '3'
+
+permissions: {}
+
+# One run at a time, never cancelled: a run in progress finishes its versions.
+concurrency:
+  group: schema-mirror-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    # A schedule run is always on the default branch; a manual run must be too, so that
+    # only reviewed code in ci/mirror/ ever publishes. [verify]
+    if: github.event_name == 'schedule' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      max_parallel: ${{ steps.plan.outputs.max_parallel }}
+    env:
+      MAX_VERSIONS: ${{ inputs.max_versions || '40' }}
+      MAX_PARALLEL: ${{ inputs.max_parallel || '3' }}
+      MIRROR_DELAY: '0.5'
+      MIRROR_USER_AGENT: provider-schema-mirror (github.com/${{ github.repository }})
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      # No token in this step. The tag list is read anonymously from the public host
+      # repository; one version list call per provider goes to the registry. The versions
+      # not yet published are interleaved by rank: every provider's newest first, then every
+      # provider's second, and so on, in providers.txt order within a rank. The first
+      # MAX_VERSIONS become the matrix; the rest wait for the next run.
+      - name: Plan the versions
+        id: plan
+        run: |
+          set -uo pipefail
+          set -f
+          [[ "$MAX_VERSIONS" =~ ^[0-9]{1,3}$ ]] && [ "$MAX_VERSIONS" -ge 1 ] && [ "$MAX_VERSIONS" -le 250 ] \
+            || { echo "::error::max_versions must be a number from 1 to 250"; exit 1; }
+          [[ "$MAX_PARALLEL" =~ ^[1-6]$ ]] || { echo "::error::max_parallel must be a number from 1 to 6"; exit 1; }
+          tags="$RUNNER_TEMP/mirror-tags"
+          planned="$RUNNER_TEMP/mirror-planned"
+          : > "$planned"
+          git ls-remote --tags --refs "https://github.com/$GITHUB_REPOSITORY.git" | sed -n 's|^[0-9a-f]*[[:space:]]*refs/tags/||p' > "$tags" \
+            || { echo "::error::cannot list the tags of the host repository"; exit 1; }
+          idx=0
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%%#*}"
+            read -r pr rest <<< "$line"
+            [ -n "${pr:-}" ] || continue
+            idx=$((idx + 1))
+            # rest is the minimum and the versions to skip; build.sh checks each word, and
+            # globbing is off.
+            # shellcheck disable=SC2086
+            vers="$(ci/mirror/build.sh select "$pr" "$tags" $rest)" || { echo "::warning::no versions for $pr; skipped"; continue; }
+            rank=0
+            for ver in $vers; do
+              rank=$((rank + 1))
+              # "_" joins namespace and name: neither may hold one, so a tag names one provider.
+              tag="${pr/\//_}-v$ver"
+              printf '%s %s %s %s %s\n' "$rank" "$idx" "$tag" "$pr" "$ver" >> "$planned"
+            done
+          done < ci/mirror/providers.txt
+          sort -s -n -k1,1 -k2,2 "$planned" | cut -d' ' -f3- | head -n "$MAX_VERSIONS" > "$planned.run"
+          echo "versions to publish: $(wc -l < "$planned"); this run builds $(wc -l < "$planned.run")"
+          {
+            printf 'matrix='
+            jq -R -s -c 'split("\n") | map(select(length > 0) | split(" ") | { tag: .[0], provider: .[1], version: .[2] })' "$planned.run"
+            echo "count=$(wc -l < "$planned.run")"
+            echo "max_parallel=$MAX_PARALLEL"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-24.04
+    # One version per job. About 0.8 s per page at MIRROR_DELAY 0.5, so a version at the
+    # MIRROR_MAX_PAGES cap takes about 70 minutes; the build step's own timeout stops a
+    # slow build and leaves time to publish before this job timeout, which stays under the
+    # six-hour job limit. [verify]
+    timeout-minutes: 240
+    permissions:
+      contents: write
+    strategy:
+      # One failed version never cancels the others.
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      # From the plan job's output: data, checked again in each step before use.
+      MATRIX_PROVIDER: ${{ matrix.provider }}
+      MATRIX_VERSION: ${{ matrix.version }}
+      MATRIX_TAG: ${{ matrix.tag }}
+      # Seconds between registry calls; one call at a time in each job.
+      MIRROR_DELAY: '0.5'
+      # The most pages one version may have; a version with more is not built. A run
+      # fetches at most max_versions times this many pages.
+      MIRROR_MAX_PAGES: '5000'
+      # Sent to the registry with every call, so its operators can tell who reads in bulk.
+      MIRROR_USER_AGENT: provider-schema-mirror (github.com/${{ github.repository }})
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      # No token in this step. build.sh writes the version's directory only when the whole
+      # build succeeded, and prints the pages it fetched, on failure too.
+      - name: Build the bundle
+        timeout-minutes: 180
+        run: |
+          set -uo pipefail
+          set -f
+          pr="$MATRIX_PROVIDER" ver="$MATRIX_VERSION" tag="$MATRIX_TAG"
+          [[ "$pr" =~ ^[a-z0-9][a-z0-9-]{0,63}/[a-z0-9][a-z0-9-]{0,63}$ && "$ver" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ && "$tag" == "${pr/\//_}-v$ver" ]] || { echo "::error::the matrix entry is not a provider, a stable version and its tag"; exit 1; }
+          out="$RUNNER_TEMP/mirror-out"
+          mkdir "$out" || exit 1
+          pages="$(ci/mirror/build.sh build "$pr" "$ver" "$out/$tag")"
+          rc=$?
+          [[ "$pages" =~ ^[0-9]{1,6}$ ]] || pages=0
+          if [ "$rc" = 0 ]; then
+            echo "built $tag: $pages pages"
+          else
+            echo "::error::$tag was not built after $pages page fetches; the next run retries it"
+            exit 1
+          fi
+
+      # The release is created as a draft, its assets uploaded, and only then published,
+      # which creates the tag. A release whose upload or publish fails is deleted while it
+      # is still a draft, so a partial release is never visible. REST only, with the job's
+      # GITHUB_TOKEN.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          set -f
+          pr="$MATRIX_PROVIDER" ver="$MATRIX_VERSION" tag="$MATRIX_TAG"
+          [[ "$pr" =~ ^[a-z0-9][a-z0-9-]{0,63}/[a-z0-9][a-z0-9-]{0,63}$ && "$ver" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ && "$tag" == "${pr/\//_}-v$ver" ]] || { echo "::error::the matrix entry is not a provider, a stable version and its tag"; exit 1; }
+          d="$RUNNER_TEMP/mirror-out/$tag"
+          tarball="${pr/\//_}-$ver.tar.gz"
+          (cd "$d" && sha256sum --strict --quiet -c SHA256SUMS) || { echo "::error::$tag: checksums do not match"; exit 1; }
+          body="$(printf '%s\n' \
+            "Documentation pages of the Terraform provider $pr, version $ver, as served by the Terraform registry:" \
+            "https://registry.terraform.io/v1/providers/$pr/$ver" \
+            "" \
+            "The provider documentation is licensed by its authors under the Mozilla Public License 2.0 (MPL-2.0):" \
+            "https://mozilla.org/MPL/2.0/. The pages are unmodified; the source is the provider's own repository." \
+            "" \
+            "Assets: $tarball (the pages), manifest.json, NOTICE, SHA256SUMS. See README.md.")"
+          id="$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$tag" -f target_commitish="$GITHUB_SHA" \
+            -f name="$pr $ver" -f body="$body" -F draft=true -f make_latest=false --jq .id)" \
+            && [[ "$id" =~ ^[0-9]+$ ]] || { echo "::error::$tag: cannot create the draft release"; exit 1; }
+          ok=1
+          for f in "$tarball" manifest.json NOTICE SHA256SUMS; do
+            # [verify] gh api accepts the absolute uploads URL
+            gh api -X POST "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$id/assets?name=$f" \
+              -H 'Content-Type: application/octet-stream' --input "$d/$f" > /dev/null || { ok=0; break; }
+          done
+          if [ "$ok" = 1 ] && gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$id" -F draft=false -f make_latest=false > /dev/null; then
+            echo "published $tag"
+            exit 0
+          fi
+          # Delete only a draft: a publish that failed on the way back may have gone through.
+          draft="$(gh api "repos/$GITHUB_REPOSITORY/releases/$id" --jq .draft)"
+          if [ "$draft" = true ]; then
+            echo "::error::$tag: the upload or publish failed; the draft is deleted and the next run retries it"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id" > /dev/null || echo "::error::$tag: delete the draft release $id by hand"
+          elif [ -z "$draft" ]; then
+            echo "::error::$tag: the upload or publish failed and release $id cannot be read back; check it by hand"
+          else
+            echo "::error::$tag: the publish reported a failure but release $id is not a draft; check it by hand"
+          fi
+          exit 1

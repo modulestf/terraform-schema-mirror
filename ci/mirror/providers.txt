@@ -1,0 +1,15 @@
+# Providers the schema mirror publishes. One provider per line: <namespace>/<name>, then
+# optionally a minimum version written >=x.y.z, then optionally versions to skip, each
+# written !x.y.z. Text after # is a comment.
+#
+# Each run publishes every stable version of each provider that is not published yet,
+# newest first, up to the run's version cap; the rest wait for the next run. A minimum
+# leaves out every version below it, for example:
+#   hashicorp/random
+#   hashicorp/google >=4.0.0
+#   hashicorp/google >=4.0.0 !4.1.0 !4.2.3
+# Skip a version only when its build fails on consecutive nights: a version that always
+# fails would otherwise take a slot of every run.
+# List only providers whose documentation is licensed under MPL-2.0: the release notes
+# state that license.
+hashicorp/aws >=2.33.0

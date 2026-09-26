@@ -18,13 +18,13 @@
 # Environment: MIRROR_DELAY, seconds between registry calls (default 0.5); MIRROR_MAX_PAGES,
 # the most pages one version may have (default 5000; a version with more is not built);
 # MIRROR_USER_AGENT, the User-Agent sent to the registry.
-# Registry calls are made one at a time, over HTTPS only, with the calls and checks of the
-# warm workflow in ci/github/schema-cache.yml.template.
+# Registry calls are made one at a time, over HTTPS only, with the calls and checks that
+# consumers of the mirror make when they fetch a page from the registry themselves.
 set -uo pipefail
 set -f
 
-# The same pattern as in ci/github/schema-cache.yml.template; tests/schema-mirror-test.sh
-# keeps the two equal.
+# The same pattern as in the README's consumer example; tests/schema-mirror-test.sh keeps
+# the two equal.
 SCHEMA_PAGE_RE='^[a-z0-9][a-z0-9-]{0,63}/[a-z0-9][a-z0-9-]{0,63}/[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}/(resources|data-sources)/[a-z0-9][a-z0-9_]{0,127}\.md$'
 NAME_RE='^[a-z0-9][a-z0-9-]{0,63}$'
 VER_RE='^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$'
@@ -94,10 +94,10 @@ build() { # namespace/name, version, output directory
     || die "the document list of $pr $ver does not parse"
   : > "$work/keep"
   : > "$work/skipped"
-  # The warm workflow finds a page by title and uses it only when exactly one hcl document of
+  # A consumer finds a page by title and uses it only when exactly one hcl document of
   # the category has that title. So a title that occurs more than once, counted over every
   # hcl document of the category, keeps none of its documents; and a page is kept only when
-  # its title is its slug, so the path the warm workflow looks up is the path written here.
+  # its title is its slug, so the path a consumer looks up is the path written here.
   awk -F'\t' 'NR == FNR { c[$2 "\t" $4]++; next } { print (c[$2 "\t" $4] == 1 ? "U" : "D") "\t" $0 }' \
     "$work/docs" "$work/docs" > "$work/counted"
   while IFS=$'\t' read -r u id cat slug title; do

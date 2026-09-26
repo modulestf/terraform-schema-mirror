@@ -1,0 +1,23 @@
+# Runs the offline test suite of the schema mirror publisher: the workflow invariants, their
+# negative self-checks, and build.sh against a stubbed registry. No network, no secret.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Run the test suite
+        run: bash tests/schema-mirror-test.sh

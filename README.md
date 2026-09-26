@@ -82,6 +82,10 @@ The job has `contents: write` to create releases and nothing else: no secret bey
 
 Open a pull request that adds a line to [ci/mirror/providers.txt](ci/mirror/providers.txt): `namespace/name`, optionally a minimum version and versions to skip, for example `hashicorp/google >=4.0.0` or `hashicorp/aws >=2.33.0 !3.12.0`. Skip a version only when its build fails on consecutive nights. Add a provider only if its documentation is licensed under MPL-2.0, because every release states that license.
 
+## Tests
+
+Run `bash tests/schema-mirror-test.sh` from the repository root; it needs bash, jq, tar, gzip and sha256sum, and makes no network call. It checks the publisher workflow's invariants (triggers, permissions, pinned actions, token scope, draft-then-publish releases, run caps) and mutates temp copies to confirm each check catches a break, then runs `ci/mirror/build.sh` against a stubbed registry and checks the bundle it writes. The same test runs on every pull request and push to `main`.
+
 ## License
 
 The provider documentation belongs to its authors and is licensed with the provider source. For the HashiCorp providers that is the [Mozilla Public License 2.0](https://mozilla.org/MPL/2.0/). This repository redistributes the pages unmodified. Each release carries a `NOTICE` asset and a release body with the license and the registry source URL.

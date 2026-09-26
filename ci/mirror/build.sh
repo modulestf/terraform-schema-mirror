@@ -2,10 +2,11 @@
 # Pick the provider versions to mirror, or build the schema page bundle of one version.
 # Run by schema-mirror.yml.template; see README.md next to this file.
 #
-#   build.sh select <namespace/name> <minor lines> [<floor version>...]
-#     Prints the versions to mirror, one per line: the newest patch of each of the latest
-#     <minor lines> minor lines, plus each floor version that the registry lists. Stable
-#     versions only.
+#   build.sh select <namespace/name> <published tags file> [>=<minimum version>] [!<version>...]
+#     Prints the versions to mirror, one per line, newest first: every stable version
+#     (x.y.z, no pre-release) that the registry lists, at or above the minimum when one is
+#     given, not skipped with !<version>, whose tag <namespace>_<name>-v<version> is not a
+#     line of the tags file.
 #   build.sh build <namespace/name> <version> <output directory>
 #     Fetches every hcl resource and data source page of that version from the Terraform
 #     registry and writes <output directory> with four files: the tar.gz, manifest.json,
@@ -47,27 +48,30 @@ provider() { # namespace/name -> sets ns and name, or exits
   [[ "$1" == */* && "$ns" =~ $NAME_RE && "$name" =~ $NAME_RE ]] || die "not a provider name: $1"
 }
 
-select_versions() { # namespace/name, minor lines, floor versions
-  local pr="$1" n="$2" all f
+select_versions() { # namespace/name, file of published tags, optional ">=x.y.z", then "!x.y.z" skips
+  local pr="$1" tags="$2" min="" skip=" " a all
   provider "$pr"
-  [[ "$n" =~ ^[0-9]{1,2}$ ]] && [ "$n" -ge 1 ] || die "not a count of minor lines: $n"
+  [ -f "$tags" ] || die "not a tags file: $tags"
   shift 2
+  if [[ "${1:-}" == ">="* ]]; then
+    [[ "$1" =~ ^\>=([0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6})$ ]] || die "not a minimum version: $1"
+    min="${BASH_REMATCH[1]}"
+    shift
+  fi
+  for a in "$@"; do
+    [[ "$a" =~ ^!([0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6})$ ]] || die "not a version to skip: $a"
+    skip="$skip${BASH_REMATCH[1]} "
+  done
   all="$(reg "v1/providers/$ns/$name/versions" | jq -r '.versions[]?.version' | grep -E "$VER_RE" | sort -uV)"
   [ -n "$all" ] || die "no release list for $pr"
-  {
-    printf '%s\n' "$all" | awk -F. -v n="$n" '
-      { k = $1 "." $2; if (!(k in last)) order[++m] = k; last[k] = $0 }
-      END { for (i = m; i > m - n && i > 0; i--) print last[order[i]] }'
-    for f in "$@"; do
-      if [[ ! "$f" =~ $VER_RE ]]; then
-        echo "::warning::the floor $f of $pr is not a stable version; skipped" >&2
-      elif printf '%s\n' "$all" | grep -qxF -- "$f"; then
-        echo "$f"
-      else
-        echo "::warning::the floor $f of $pr is not in the registry; skipped" >&2
-      fi
-    done
-  } | sort -uV
+  # "_" joins namespace and name: neither may hold one, so a tag names one provider.
+  # FILENAME, not NR == FNR: the tags file is empty before the first release.
+  printf '%s\n' "$all" | awk -F. -v m="$min" -v p="${ns}_${name}" -v tf="$tags" -v skip="$skip" '
+    BEGIN { split(m, a, ".") }
+    FILENAME == tf { t[$0]; next }
+    index(skip, " " $0 " ") { next }
+    m != "" && ($1 + 0 < a[1] + 0 || ($1 + 0 == a[1] + 0 && ($2 + 0 < a[2] + 0 || ($2 + 0 == a[2] + 0 && $3 + 0 < a[3] + 0)))) { next }
+    !((p "-v" $0) in t)' "$tags" - | sort -rV
 }
 
 build() { # namespace/name, version, output directory
@@ -155,7 +159,7 @@ build() { # namespace/name, version, output directory
 }
 
 case "${1:-}" in
-select) [ "$#" -ge 3 ] || die "usage: build.sh select <namespace/name> <minor lines> [<floor version>...]"; shift; select_versions "$@" ;;
+select) [ "$#" -ge 3 ] || die "usage: build.sh select <namespace/name> <published tags file> [>=<minimum version>] [!<version>...]"; shift; select_versions "$@" ;;
 build) [ "$#" = 4 ] || die "usage: build.sh build <namespace/name> <version> <output directory>"; shift; build "$@" ;;
 *) die "usage: build.sh select|build ..." ;;
 esac

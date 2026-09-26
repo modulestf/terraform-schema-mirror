@@ -2,7 +2,7 @@
 
 Terraform provider documentation, one release per provider version, ready to download without a token.
 
-Every `resource` and `data source` page of a provider version is packed into one `.tar.gz` and published as a GitHub release asset, with a checksum file, a manifest and a license notice. A page at a provider version never changes, so each version is built once and kept forever. A nightly job adds new provider releases as they appear in the [Terraform registry](https://registry.terraform.io/).
+Every `resource` and `data source` page of a provider version is packed into one `.tar.gz` and published as a GitHub release asset, with a checksum file, a manifest and a license notice. Every stable version is mirrored, so a tool finds the version a module pins without knowing it in advance. A page at a provider version never changes, so each version is built once and kept forever. A nightly job adds new provider releases as they appear in the [Terraform registry](https://registry.terraform.io/) and continues the backfill of older ones, newest first.
 
 Use it when a tool reads many provider pages, for example a code review agent that checks a module against the provider schema: one download replaces hundreds of registry calls, and the registry sees the load once instead of once per user.
 
@@ -10,7 +10,7 @@ Use it when a tool reads many provider pages, for example a code review agent th
 
 | Provider | Versions |
 |----------|----------|
-| `hashicorp/aws` | the newest patch of the latest three minor lines, plus `5.46.0` and `6.0.0` |
+| `hashicorp/aws` | every stable version from `2.33.0` up (399 versions; the registry has no pages for older ones) |
 
 The full list of published versions is the [releases page](../../releases). The providers and their pinned versions are in [ci/mirror/providers.txt](ci/mirror/providers.txt).
 
@@ -60,14 +60,14 @@ No release is marked as the latest, because several provider versions are publis
 
 [.github/workflows/schema-mirror.yml](.github/workflows/schema-mirror.yml) runs every night at 03:17 UTC and on a manual run. It runs [ci/mirror/build.sh](ci/mirror/build.sh) for each version that has no release yet:
 
-1. Read the version list from the registry and pick the newest patch of the latest three minor lines, plus the floor versions in `providers.txt`. Pre-releases are skipped.
-2. List the version's documents, keep each hcl resource and data source page whose path passes the page pattern and whose title is unique, and fetch each one, checking its id, category and language.
+1. A `plan` job with no write access lists the published tags and reads the version list from the registry. It picks every stable version not yet published, newest first, above the provider's minimum and minus any skipped version, interleaves providers so each provider's newest release comes first, and caps the run at 40 versions. Pre-releases are skipped.
+2. A `build` job per version, three at a time, lists the version's documents, keep each hcl resource and data source page whose path passes the page pattern and whose title is unique, and fetch each one, checking its id, category and language.
 3. Pack the pages and write the manifest, the notice and the checksums.
 4. Create a draft release, upload the four assets, and publish it only when every upload succeeded.
 
-A version with any failed page is not published and is retried the next night. A partial release is never visible.
+A version with any failed page is not published and is retried the next night; one failed version never blocks the others. A partial release is never visible.
 
-Registry calls go one at a time over HTTPS, with a 0.5 second pause and a User-Agent that names this repository. A run stops starting new versions after 12,000 page fetches or 240 minutes, so the first run of a large provider can take two nights. After that, a night with no new provider release costs one tag listing and one version list call per provider.
+Registry calls go over HTTPS with a 0.5 second pause in each job and a User-Agent that names this repository: about 3.75 calls per second at three jobs. The first backfill of `hashicorp/aws` is about 620,000 pages, roughly ten nights of 40 versions. After that, a night with no new provider release costs one tag listing and one version list call per provider.
 
 The job has `contents: write` to create releases and nothing else: no secret beyond `GITHUB_TOKEN`, no cloud credential and no model. It never runs on a pull request.
 
@@ -80,7 +80,7 @@ The job has `contents: write` to create releases and nothing else: no secret bey
 
 ## Add a provider
 
-Open a pull request that adds a line to [ci/mirror/providers.txt](ci/mirror/providers.txt): `namespace/name`, then any floor versions to pin, for example `hashicorp/google 6.0.0`. Add a provider only if its documentation is licensed under MPL-2.0, because every release states that license.
+Open a pull request that adds a line to [ci/mirror/providers.txt](ci/mirror/providers.txt): `namespace/name`, optionally a minimum version and versions to skip, for example `hashicorp/google >=4.0.0` or `hashicorp/aws >=2.33.0 !3.12.0`. Skip a version only when its build fails on consecutive nights. Add a provider only if its documentation is licensed under MPL-2.0, because every release states that license.
 
 ## License
 

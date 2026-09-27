@@ -8,8 +8,22 @@
 #   hashicorp/random
 #   hashicorp/google >=4.0.0
 #   hashicorp/google >=4.0.0 !4.1.0 !4.2.3
+# Versions built only for plugin protocol 4 (Terraform 0.11) are left out on their own:
+# current terraform cannot read their schema.
 # Skip a version only when its build fails on consecutive nights: a version that always
 # fails would otherwise take a slot of every run.
-# List only providers whose documentation is licensed under MPL-2.0: the release notes
-# state that license.
-hashicorp/aws >=2.33.0
+# List only providers licensed under MPL-2.0: the release notes and NOTICE state that
+# license.
+hashicorp/aws
+hashicorp/random
+hashicorp/null
+hashicorp/local
+hashicorp/external
+hashicorp/archive
+hashicorp/tls
+hashicorp/time
+hashicorp/http
+hashicorp/cloudinit
+hashicorp/helm
+hashicorp/kubernetes
+kreuzwerker/docker

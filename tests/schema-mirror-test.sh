@@ -3,7 +3,8 @@
 # Offline check for the provider schema mirror: the publisher workflow
 # (.github/workflows/schema-mirror.yml) as text, one named check per invariant, with a
 # negative self-check that mutates temp copies and confirms the matching check fails on
-# each; then a run of ci/mirror/build.sh with curl stubbed on fixture JSON. No network.
+# each; then a run of ci/mirror/build.sh with curl and terraform stubbed on fixture JSON.
+# No network.
 # Run: bash tests/schema-mirror-test.sh
 set -uo pipefail
 
@@ -42,13 +43,6 @@ job() { # job name; stdin -> the lines of that job
 reassign() { # variable name -> an extended regex for a line that sets it
   printf '%s' "(^|[^\$A-Za-z0-9_])$1(\\+?=|:)|(read|declare|typeset|export|local|unset|printf -v|mapfile)[^;|&]*[^\$A-Za-z0-9_]$1([^A-Za-z0-9_]|\$)"
 }
-page_re() { # file -> the SCHEMA_PAGE_RE value it sets, in YAML or shell form
-  sed -nE "s/^ *SCHEMA_PAGE_RE[:=] *'(.*)' *$/\1/p" "$1"
-}
-readme_page_re() { # file -> the page_re value of the consumer example
-  sed -nE "s/^page_re='(.*)'$/\1/p" "$1"
-}
-
 TOKEN_RE='github\.token|github\[|toJSON\( *github *\)|secrets\.|secrets\[|toJSON\( *secrets *\)|GH_TOKEN|GITHUB_TOKEN'
 BRANCH_IF="    if: github.event_name == 'schedule' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
 # The first lines of every build job step that reads a matrix value, in this order.
@@ -58,7 +52,7 @@ MATRIX_ASSIGN='pr="$MATRIX_PROVIDER" ver="$MATRIX_VERSION" tag="$MATRIX_TAG"'
 MATRIX_CHECK='[[ "$pr" =~ ^[a-z0-9][a-z0-9-]{0,63}/[a-z0-9][a-z0-9-]{0,63}$ && "$ver" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ && "$tag" == "${pr/\//_}-v$ver" ]] || { echo "::error::the matrix entry is not a provider, a stable version and its tag"; exit 1; }'
 
 run_checks() { # workflow, build script, providers file, README -> ok or FAIL line per invariant, with the reasons indented
-  local t b p r pj bj
+  local t b p r pj bj uj
   # Always run in a command substitution. grep -q stops reading early, and under pipefail
   # the writer's SIGPIPE would fail a check at random, so pipefail is off in here.
   set +o pipefail
@@ -66,6 +60,7 @@ run_checks() { # workflow, build script, providers file, README -> ok or FAIL li
   b="$(strip "$2")"
   pj="$(printf '%s\n' "$t" | job plan)"
   bj="$(printf '%s\n' "$t" | job build)"
+  uj="$(printf '%s\n' "$t" | job publish)"
   r() { # number, name, reasons (empty = holds)
     if [ -z "$3" ]; then echo "ok   $1 $2"; else echo "FAIL $1 $2"; printf '%s\n' "$3" | sed 's/^/       /'; fi
   }
@@ -74,18 +69,22 @@ run_checks() { # workflow, build script, providers file, README -> ok or FAIL li
     got="$(printf '%s\n' "$t" | awk '/^"?on"?:/ { on = 1; next } on && /^[^ ]/ { on = 0 } on' | sed -nE 's/^  ([A-Za-z_]+):.*/\1/p' | sort | tr '\n' ' ')"
     [ "$got" = "schedule workflow_dispatch " ] || echo "triggers: $got")"
 
-  r 2 "plan runs only on the default branch; build only after plan, when it has work" "$(
-    [ "$(printf '%s\n' "$t" | grep -cE '^    if:')" = 2 ] || echo "not exactly two job conditions"
+  r 2 "plan runs only on the default branch; build and publish only after plan, when it has work" "$(
+    [ "$(printf '%s\n' "$t" | grep -cE '^    if:')" = 3 ] || echo "not exactly three job conditions"
     printf '%s\n' "$pj" | grep -qxF -- "$BRANCH_IF" || echo "the default branch condition of plan is missing"
     printf '%s\n' "$bj" | grep -qxF '    needs: plan' || echo "build does not need plan"
-    printf '%s\n' "$bj" | grep -qxF "    if: needs.plan.outputs.count != '0'" || echo "the condition of build is not the plan count alone")"
+    printf '%s\n' "$bj" | grep -qxF "    if: needs.plan.outputs.count != '0'" || echo "the condition of build is not the plan count alone"
+    printf '%s\n' "$uj" | grep -qxF '    needs: [plan, build]' || echo "publish does not need plan and build"
+    # shellcheck disable=SC2016 # workflow text, not shell
+    printf '%s\n' "$uj" | grep -qxF '    if: ${{ !cancelled() && needs.plan.outputs.count != '"'0'"' }}' || echo "the condition of publish is not the plan count unless cancelled")"
 
-  r 3 "permissions: none at the top, contents: write in the job, nothing else" "$(
+  r 3 "permissions: none at the top, contents: read in plan and build, write in publish only" "$(
     printf '%s\n' "$t" | grep -qxE 'permissions: *\{\} *' || echo "the top-level permissions are not {}"
     g="$(printf '%s\n' "$t" | sed 's/ #.*//' | grep -E ':[[:space:]]*"?(read|write|write-all|read-all)"?[[:space:]]*$')"
-    [ "$g" = "$(printf '      contents: read\n      contents: write')" ] || printf 'grants:\n%s\n' "$g"
+    [ "$g" = "$(printf '      contents: read\n      contents: read\n      contents: write')" ] || printf 'grants:\n%s\n' "$g"
     printf '%s\n' "$pj" | grep -qxF '      contents: read' || echo "plan does not hold contents: read"
-    printf '%s\n' "$bj" | grep -qxF '      contents: write' || echo "build does not hold contents: write")"
+    printf '%s\n' "$bj" | grep -qxF '      contents: read' || echo "build does not hold contents: read"
+    printf '%s\n' "$uj" | grep -qxF '      contents: write' || echo "publish does not hold contents: write")"
 
   r 4 "every action is pinned by a full SHA with a version comment" "$(
     printf '%s\n' "$t" | grep -E '^[ -]*uses:' | grep -vE 'uses: *[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40} # v[0-9]')"
@@ -136,23 +135,22 @@ run_checks() { # workflow, build script, providers file, README -> ok or FAIL li
     printf '%s\n' "$pub" | grep -qF 'if [ "$draft" = true ]; then' || echo "the delete is not limited to a draft"
     printf '%s\n' "$pub" | grep -qF 'sha256sum --strict --quiet -c SHA256SUMS' || echo "the checksums are not checked before upload")"
 
-  r 12 "pages are built by ci/mirror/build.sh in the build step only; published tags are skipped" "$(
-    printf '%s\n' "$t" | step '^      - name: Build' | grep -qF 'ci/mirror/build.sh build "$pr" "$ver" "$out/$tag"' || echo "the build step does not run build.sh build"
+  r 12 "the schema is built by ci/mirror/build.sh in the build job only; published tags are skipped" "$(
+    printf '%s\n' "$bj" | step '^      - name: Build' | grep -qF 'ci/mirror/build.sh build "$pr" "$ver" "$out/$tag"' || echo "the build step does not run build.sh build"
     printf '%s\n' "$t" | step '^      - name: Publish' | grep -nE 'build\.sh|(^|[^a-z])curl ' | sed 's/^/publish step: /'
+    printf '%s\n' "$uj" | grep -nE 'build\.sh|setup-terraform|actions/checkout@' | sed 's/^/publish job: /'
     printf '%s\n' "$pj" | grep -nF 'build.sh build' | sed 's/^/plan job: /'
     printf '%s\n' "$pj" | grep -qF 'ci/mirror/build.sh select "$pr" "$tags" ' || echo "plan does not pass the tag list to select"
     printf '%s\n' "$b" | grep -qF -- '-v p="${ns}_${name}"' && printf '%s\n' "$b" | grep -qF '!((p "-v" $0) in t)' || echo "select does not skip a published tag"
     printf '%s\n' "$pj" | grep -qF 'tag="${pr/\//_}-v$ver"' || echo "the tag does not join namespace and name with _"
-    printf '%s\n' "$t" | grep -qF 'tarball="${pr/\//_}-$ver.tar.gz"' || echo "the tarball name does not join namespace and name with _"
-    printf '%s\n' "$b" | grep -qF 'tarball="${ns}_${name}-${ver}.tar.gz"' || echo "build.sh does not join namespace and name with _")"
+    printf '%s\n' "$t" | grep -qF 'file="${pr/\//_}-$ver.schema.json.gz"' || echo "the schema file name does not join namespace and name with _"
+    printf '%s\n' "$b" | grep -qF 'file="${ns}_${name}-${ver}.schema.json.gz"' || echo "build.sh does not join namespace and name with _")"
 
-  r 13 "SCHEMA_PAGE_RE in build.sh equals the README's consumer pattern, and the workflow's if it sets one" "$(
-    a="$(page_re "$2")" m="$(readme_page_re "$4")" w="$(page_re "$1")"
-    [ -n "$a" ] && [ "$(printf '%s\n' "$a" | wc -l)" = 1 ] || echo "build.sh does not set SCHEMA_PAGE_RE exactly once"
-    [ -n "$m" ] && [ "$(printf '%s\n' "$m" | wc -l)" = 1 ] || echo "the README does not set page_re exactly once"
-    [ "$a" = "$m" ] || echo "build.sh: $a; README: $m"
-    [ -z "$w" ] || [ "$w" = "$a" ] || echo "build.sh: $a; workflow: $w"
-    printf '%s\n' "$b" | grep -qE '\[\[ "\$p" =~ \$SCHEMA_PAGE_RE' || echo "no path is checked against SCHEMA_PAGE_RE")"
+  r 13 "build.sh pins the exact version and keeps only a schema of that one provider, not empty" "$(
+    printf '%s\n' "$b" | grep -qF 'version = "= %s"' || echo "main.tf does not pin the exact version"
+    printf '%s\n' "$b" | grep -qF 'key="registry.terraform.io/$ns/$name"' || echo "the provider key is not the registry address"
+    printf '%s\n' "$b" | grep -qF '(.provider_schemas | keys == [$k])' || echo "the schema is not checked to hold exactly the provider"
+    printf '%s\n' "$b" | grep -qF '((.provider_schemas[$k].data_source_schemas // {}) | length) > 0)' || echo "an empty schema is not refused")"
 
   r 14 "build.sh calls the registry over HTTPS only" "$(
     c="$(printf '%s\n' "$b" | grep -E '(^|[^a-z])curl ')"
@@ -162,10 +160,10 @@ run_checks() { # workflow, build script, providers file, README -> ok or FAIL li
     printf '%s\n' "$c" | grep -vF -- '-A "$USER_AGENT"' | sed 's/^/without a User-Agent: /'
     printf '%s\n' "$b" | grep -nF 'http://' | sed 's/^/plain http: /')"
 
-  r 15 "build.sh packs regular files only, from a checked list" "$(
-    printf '%s\n' "$b" | grep -qF 'find "$stage" -mindepth 1 ! -type f ! -type d' || echo "no refusal of a link or special file"
-    printf '%s\n' "$b" | grep -qF "find . -type f -printf '%P\\n'" || echo "the list is not regular files"
-    printf '%s\n' "$b" | grep -E '^ *tar ' | grep -qE -- '--no-recursion .*-T "\$work/files"' || echo "tar is not limited to the list")"
+  r 15 "terraform runs with no CLI config file, and the schema is written reproducibly" "$(
+    printf '%s\n' "$b" | grep -qF 'TF_CLI_CONFIG_FILE=/dev/null' || echo "terraform may read a CLI config file"
+    printf '%s\n' "$b" | grep -qF 'CHECKPOINT_DISABLE=1' || echo "the checkpoint call is not disabled"
+    printf '%s\n' "$b" | grep -qF 'jq -S -c . "$work/schema.json" | gzip -n -9 > "$work/out/$file"' || echo "the schema is not normalized and gzipped without name and time")"
 
   r 16 "globbing is off in build.sh and in every run block" "$(
     printf '%s\n' "$b" | grep -qxF 'set -f' || echo "build.sh"
@@ -186,12 +184,10 @@ run_checks() { # workflow, build script, providers file, README -> ok or FAIL li
 
   r 18 "plain ASCII" "$(LC_ALL=C grep -nP '[^\x20-\x7e\t]' "$1" "$2" "$3" "$4")"
 
-  r 19 "a job builds one version, reports its fetches and fails when it fails; a run is capped" "$(
+  r 19 "a job builds one version and fails when it fails; a run is capped" "$(
     bs="$(printf '%s\n' "$bj" | step '^      - name: Build')"
-    printf '%s\n' "$b" | grep -qF 'die() { [ -n "${fetched:-}" ] && echo "$fetched";' || echo "build.sh does not report fetches on failure"
-    printf '%s\n' "$bs" | grep -qxF '          pages="$(ci/mirror/build.sh build "$pr" "$ver" "$out/$tag")"' || echo "pages is not build.sh's output"
-    printf '%s\n' "$bs" | grep -A1 -F 'echo "::error::$tag was not built after' | tail -n 1 | grep -qxE ' +exit 1' || echo "a failed build does not fail the job"
-    printf '%s\n' "$bj" | grep -qE "^      MIRROR_MAX_PAGES: *'?[0-9]+'? *$" || echo "no page cap in the build job"
+    printf '%s\n' "$bs" | grep -qxF '          if counts="$(ci/mirror/build.sh build "$pr" "$ver" "$out/$tag")"; then' || echo "the build step does not test the status of build.sh"
+    printf '%s\n' "$bs" | grep -A1 -F 'echo "::error::$tag was not built' | tail -n 1 | grep -qxE ' +exit 1' || echo "a failed build does not fail the job"
     ps="$(printf '%s\n' "$pj" | step '^      - name: Plan')"
     printf '%s\n' "$ps" | grep -qE "\\| awk -v n=\"\\\$MAX_VERSIONS\" 'NR <= n' > \"\\\$planned\\.run\"\$" || echo "the versions of a run are not capped"
     printf '%s\n' "$ps" | grep -E '^ +jq ' | grep -qE '"\$planned\.run"$' || echo "the matrix is not the capped list")"
@@ -199,22 +195,27 @@ run_checks() { # workflow, build script, providers file, README -> ok or FAIL li
   r 20 "the publish step uploads exactly the files build.sh writes" "$(
     w="$(printf '%s\n' "$b" | grep -E '^ *mv -- "\$work/out/' | grep -oE '"\$work/out/[^"]+"' | sed -E 's|"\$work/out/(.*)"|\1|' | sort | tr '\n' ' ')"
     u="$(printf '%s\n' "$t" | step '^      - name: Publish' | sed -nE 's/^ *for f in (.*); do$/\1/p' | tr -d '"' | tr ' ' '\n' | grep . | sort | tr '\n' ' ')"
-    [ -n "$w" ] && [ "$w" = "$u" ] || echo "build.sh writes: $w; the publish step uploads: $u")"
+    [ -n "$w" ] && [ "$w" = "$u" ] || echo "build.sh writes: $w; the publish step uploads: $u"
+    # shellcheck disable=SC2016 # workflow text, not shell
+    for a in '          name: ${{ env.MATRIX_TAG }}' '          path: ${{ runner.temp }}/mirror-out/${{ env.MATRIX_TAG }}'; do
+      printf '%s\n' "$bj" | grep -qxF -- "$a" && printf '%s\n' "$uj" | grep -qxF -- "$a" || echo "the artifact steps differ from:$a"
+    done
+    printf '%s\n' "$t" | step '^      - name: Publish' | grep -qxF '          d="$RUNNER_TEMP/mirror-out/$tag"' || echo "the publish step does not read the downloaded bundle")"
 
-  r 21 "the build step timeout fits a capped version and leaves time to publish under six hours" "$(
+  r 21 "the build step timeout leaves time to upload within a build job timeout of an hour at most" "$(
     tm="$(printf '%s\n' "$bj" | sed -nE 's/^    timeout-minutes: *([0-9]+) *$/\1/p')"
     st="$(printf '%s\n' "$bj" | step '^      - name: Build' | sed -nE 's/^        timeout-minutes: *([0-9]+) *$/\1/p')"
-    mp="$(printf '%s\n' "$bj" | sed -nE "s/^ +MIRROR_MAX_PAGES: *'?([0-9]+)'? *$/\\1/p")"
-    [ -n "$tm" ] && [ -n "$st" ] && [ -n "$mp" ] || echo "job timeout ${tm:-none}, build step timeout ${st:-none}, page cap ${mp:-none}"
-    [ -n "$tm" ] && [ "$tm" -lt 360 ] || echo "the job timeout ${tm:-none} is not under six hours"
-    [ -n "$tm" ] && [ -n "$st" ] && [ $((tm - st)) -ge 30 ] || echo "the build step timeout ${st:-none} is within 30 minutes of the job timeout ${tm:-none}"
-    # One second per page, above the 0.8 s the pause and the call take.
-    [ -n "$st" ] && [ -n "$mp" ] && [ "$mp" -le $((st * 60)) ] || echo "a version of ${mp:-none} pages does not fit ${st:-none} minutes")"
+    [ -n "$tm" ] && [ -n "$st" ] || echo "job timeout ${tm:-none}, build step timeout ${st:-none}"
+    [ -n "$tm" ] && [ "$tm" -le 60 ] || echo "the build job timeout ${tm:-none} is over an hour"
+    [ -n "$tm" ] && [ -n "$st" ] && [ $((tm - st)) -ge 5 ] || echo "the build step timeout ${st:-none} is within 5 minutes of the job timeout ${tm:-none}")"
 
-  r 22 "build runs the plan's matrix, fail-fast off, max-parallel bounded 1-6" "$(
-    printf '%s\n' "$bj" | grep -qxF '        include: ${{ fromJSON(needs.plan.outputs.matrix) }}' || echo "the matrix is not the plan output"
-    printf '%s\n' "$bj" | grep -qxF '      fail-fast: false' || echo "fail-fast is not false"
-    printf '%s\n' "$bj" | grep -qxF '      max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}' || echo "max-parallel is not the plan output"
+  r 22 "build and publish run the plan's matrix, fail-fast off, max-parallel bounded 1-6" "$(
+    for j in build publish; do
+      jt="$(printf '%s\n' "$t" | job "$j")"
+      printf '%s\n' "$jt" | grep -qxF '        include: ${{ fromJSON(needs.plan.outputs.matrix) }}' || echo "the $j matrix is not the plan output"
+      printf '%s\n' "$jt" | grep -qxF '      fail-fast: false' || echo "fail-fast is not false in $j"
+      printf '%s\n' "$jt" | grep -qxF '      max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}' || echo "max-parallel is not the plan output in $j"
+    done
     printf '%s\n' "$pj" | grep -qxF '      max_parallel: ${{ steps.plan.outputs.max_parallel }}' || echo "plan does not output max_parallel"
     ps="$(printf '%s\n' "$pj" | step '^      - name: Plan')"
     ck="$(printf '%s\n' "$ps" | grep -nxF '          [[ "$MAX_PARALLEL" =~ ^[1-6]$ ]] || { echo "::error::max_parallel must be a number from 1 to 6"; exit 1; }' | head -n 1 | cut -d: -f1)"
@@ -222,16 +223,18 @@ run_checks() { # workflow, build script, providers file, README -> ok or FAIL li
     [ -n "$ck" ] && [ -n "$wr" ] && [ "$ck" -lt "$wr" ] || echo "max_parallel is not checked to 1-6 before it is output"
     printf '%s\n' "$ps" | grep -nE "$(reassign MAX_PARALLEL)" | sed 's/^/MAX_PARALLEL set in the plan step: /')"
 
-  r 23 "every build job step that reads a matrix value checks it first" "$(
+  r 23 "every run step that reads a matrix value checks it first" "$(
     n=0
-    while IFS= read -r nm; do
-      s="$(printf '%s\n' "$bj" | step "^      - name: $nm\$")"
-      printf '%s\n' "$s" | grep -qF 'MATRIX_' || continue
-      n=$((n + 1))
-      first="$(printf '%s\n' "$s" | runs | sed 's/^ *//' | awk 'NF' | head -n 4)"
-      want="$(printf '%s\n' 'set -uo pipefail' 'set -f' "$MATRIX_ASSIGN" "$MATRIX_CHECK")"
-      [ "$first" = "$want" ] || echo "step $nm does not check the matrix values first"
-    done <<< "$(printf '%s\n' "$bj" | sed -nE 's/^      - name: (.*)$/\1/p')"
+    for j in "$bj" "$uj"; do
+      while IFS= read -r nm; do
+        s="$(printf '%s\n' "$j" | step "^      - name: $nm\$")"
+        printf '%s\n' "$s" | runs | grep -qF 'MATRIX_' || continue
+        n=$((n + 1))
+        first="$(printf '%s\n' "$s" | runs | sed 's/^ *//' | awk 'NF' | head -n 4)"
+        want="$(printf '%s\n' 'set -uo pipefail' 'set -f' "$MATRIX_ASSIGN" "$MATRIX_CHECK")"
+        [ "$first" = "$want" ] || echo "step $nm does not check the matrix values first"
+      done <<< "$(printf '%s\n' "$j" | sed -nE 's/^      - name: (.*)$/\1/p')"
+    done
     [ "$n" -ge 2 ] || echo "$n steps read matrix values")"
 
   r 24 "the plan interleaves providers by rank, then caps the run" "$(
@@ -306,16 +309,9 @@ skip_before_minimum() { cat; echo "hashicorp/random !1.0.0 >=1.0.0"; }
 no_tag_skip() { sed 's/!((p "-v" \$0) in t)/1/'; }
 build_in_plan() { awk '{ print } /^          : > "\$planned"$/ { print "          ci/mirror/build.sh build hashicorp/aws 6.0.0 x" }'; }
 no_tags_to_select() { sed 's/build.sh select "\$pr" "\$tags" /build.sh select "$pr" \/dev\/null /'; }
-loose_re() { sed '0,/{0,127}/s/{0,127}/{0,255}/'; }
 # shellcheck disable=SC2016 # workflow text, not shell
-tpl_page_re() { awk '/^jobs:/ { print "env:"; print "  SCHEMA_PAGE_RE: '"'"'^.*$'"'"'" } { print }'; }
-readme_loose_re() { sed "0,/^page_re='/s/{0,127}/{0,255}/"; }
-readme_two_re() { awk '{ print } /^page_re=/ { print }'; }
-no_path_check() { grep -vF '[[ "$p" =~ $SCHEMA_PAGE_RE ]] || die'; }
 no_proto() { sed "s/ --proto '=https'//"; }
 other_host() { sed 's|"https://registry.terraform.io/$1"|"https://example.invalid/$1"|'; }
-no_link_refusal() { grep -vF '! -type f ! -type d'; }
-recursive_tar() { sed 's/ --no-recursion//'; }
 no_set_f_build() { grep -vxF 'set -f'; }
 no_set_f_tpl() { awk '/^          set -f$/ && !done { done = 1; next } { print }'; }
 bad_provider() { cat; echo "Hashicorp/AWS"; }
@@ -326,14 +322,14 @@ publish_latest() { sed 's/-F draft=false -f make_latest=false/-F draft=false/'; 
 no_readback() { grep -vF -- '--jq .draft)"'; }
 delete_any() { sed 's/if \[ "\$draft" = true \]; then/if true; then/'; }
 dash_tag() { sed 's|tag="${pr/\\//_}-v$ver"|tag="${pr/\\//-}-v$ver"|'; }
-dash_tarball() { sed 's|tarball="${ns}_${name}-${ver}.tar.gz"|tarball="$ns-$name-$ver.tar.gz"|'; }
+dash_file() { sed 's|file="${ns}_${name}-${ver}.schema.json.gz"|file="$ns-$name-$ver.schema.json.gz"|'; }
 no_ua() { sed 's/ -A "\$USER_AGENT"//'; }
 plan_write() { sed 's/^      contents: read$/      contents: write/'; }
 build_always() { sed "s/^    if: needs.plan.outputs.count != '0'$/    if: always()/"; }
 no_needs() { grep -vxF '    needs: plan'; }
 # shellcheck disable=SC2016 # workflow text, not shell
 token_in_plan() { awk '/^      - name: Plan/ { print; print "        env:"; print "          GH_TOKEN: ${{ github.token }}"; next } { print }'; }
-failed_build_passes() { awk '/::error::\$tag was not built after/ { print; getline; next } { print }'; }
+failed_build_passes() { awk '/::error::\$tag was not built/ { print; getline; next } { print }'; }
 no_run_cap() { sed "s/ | awk -v n=\"\\\$MAX_VERSIONS\" 'NR <= n'//"; }
 fail_fast() { sed 's/fail-fast: false/fail-fast: true/'; }
 wide_parallel() { sed 's/"\$MAX_PARALLEL" =~ ^\[1-6\]\$/"$MAX_PARALLEL" =~ ^[0-9]+$/'; }
@@ -341,19 +337,31 @@ wide_parallel() { sed 's/"\$MAX_PARALLEL" =~ ^\[1-6\]\$/"$MAX_PARALLEL" =~ ^[0-9
 other_matrix() { sed 's/include: \${{ fromJSON(needs.plan.outputs.matrix) }}/include: ${{ fromJSON(inputs.matrix) }}/'; }
 no_recheck_build() { C="$MATRIX_CHECK" awk 'BEGIN { c = ENVIRON["C"] } ''$0 == "          " c && !done { done = 1; next } { print }'; }
 no_recheck_publish() { C="$MATRIX_CHECK" awk 'BEGIN { c = ENVIRON["C"] } ''$0 == "          " c && ++n == 2 { next } { print }'; }
-no_notice_upload() { sed 's/for f in "\$tarball" manifest.json NOTICE SHA256SUMS; do/for f in "$tarball" manifest.json SHA256SUMS; do/'; }
-long_timeout() { sed -E 's/^    timeout-minutes: 240$/    timeout-minutes: 400/'; }
-close_step_timeout() { sed -E 's/^        timeout-minutes: *[0-9]+$/        timeout-minutes: 230/'; }
-big_page_cap() { sed -E "s/^      MIRROR_MAX_PAGES: '[0-9]+'/      MIRROR_MAX_PAGES: '20000'/"; }
-no_fetch_report() { sed 's/die() { \[ -n "${fetched:-}" \] \&\& echo "$fetched"; /die() { /'; }
+no_notice_upload() { sed 's/for f in "\$file" manifest.json NOTICE SHA256SUMS; do/for f in "$file" manifest.json SHA256SUMS; do/'; }
+long_timeout() { sed -E 's/^    timeout-minutes: 30$/    timeout-minutes: 90/'; }
+close_step_timeout() { sed -E 's/^        timeout-minutes: *[0-9]+$/        timeout-minutes: 28/'; }
+
+build_write() { awk '/^  build:$/ { b = 1 } /^  publish:$/ { b = 0 } b && /^      contents: read$/ { print "      contents: write"; next } { print }'; }
+publish_always() { sed "s/^    if: \${{ !cancelled() \&\& needs.plan.outputs.count != '0' }}$/    if: always()/"; }
+publish_no_build() { sed 's/^    needs: \[plan, build\]$/    needs: plan/'; }
+checkout_in_publish() { sed 's/^      - name: Download the bundle$/      - uses: actions\/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0\n        with:\n          persist-credentials: false\n&/'; }
+other_artifact() { sed '0,/^          name: \${{ env.MATRIX_TAG }}$/s//          name: bundle/'; }
+loose_version() { sed 's/version = "= %s"/version = ">= %s"/'; }
+loose_key() { sed 's/(.provider_schemas | keys == \[\$k\])/(.provider_schemas | has($k))/'; }
+empty_ok() { sed 's/data_source_schemas \/\/ {}) | length) > 0)/data_source_schemas \/\/ {}) | length) >= 0)/'; }
+cli_config() { sed 's/ TF_CLI_CONFIG_FILE=\/dev\/null//'; }
+unsorted() { sed 's/jq -S -c \. "\$work\/schema.json"/jq -c . "$work\/schema.json"/'; }
 
 mutate "a push trigger" 1 t add_push
 mutate "a job condition for any branch" 2 t any_branch
 mutate "build run always" 2 t build_always
 mutate "build without needs: plan" 2 t no_needs
+mutate "publish run always" 2 t publish_always
+mutate "publish not after build" 2 t publish_no_build
 mutate "write-all at the top" 3 t write_all
 mutate "id-token: write in the job" 3 t id_token
 mutate "contents: write in plan" 3 t plan_write
+mutate "contents: write in build" 3 t build_write
 mutate "an action pinned by tag" 4 t unpin
 mutate "persist-credentials: true" 5 t persist
 mutate "the token in the build step" 6 t token_in_build
@@ -381,17 +389,16 @@ mutate "a build in the plan job" 12 t build_in_plan
 mutate "select not given the tag list" 12 t no_tags_to_select
 mutate "a published tag not skipped by select" 12 b no_tag_skip
 mutate "a tag joined with -" 12 t dash_tag
-mutate "a tarball name joined with -" 12 b dash_tarball
-mutate "a loosened SCHEMA_PAGE_RE in build.sh" 13 b loose_re
-mutate "a loosened page_re in the README" 13 r readme_loose_re
-mutate "page_re set twice in the README" 13 r readme_two_re
-mutate "another SCHEMA_PAGE_RE in the workflow" 13 t tpl_page_re
-mutate "the page path check removed" 13 b no_path_check
+mutate "a schema file name joined with -" 12 b dash_file
+mutate "a checkout in the publish job" 12 t checkout_in_publish
+mutate "a version range in main.tf" 13 b loose_version
+mutate "a schema with other providers kept" 13 b loose_key
+mutate "an empty schema kept" 13 b empty_ok
 mutate "curl without --proto =https" 14 b no_proto
 mutate "curl to another host" 14 b other_host
 mutate "curl without a User-Agent" 14 b no_ua
-mutate "the link refusal removed" 15 b no_link_refusal
-mutate "tar recursing into directories" 15 b recursive_tar
+mutate "terraform with the runner's CLI config" 15 b cli_config
+mutate "schema keys not sorted" 15 b unsorted
 mutate "globbing on in build.sh" 16 b no_set_f_build
 mutate "globbing on in a run block" 16 t no_set_f_tpl
 mutate "a bad provider line" 17 p bad_provider
@@ -400,13 +407,12 @@ mutate "two minimums on a line" 17 p two_minimums
 mutate "a malformed version to skip" 17 p bad_skip
 mutate "a version to skip before the minimum" 17 p skip_before_minimum
 mutate "a non-ASCII character" 18 t non_ascii
-mutate "build.sh silent about fetches on failure" 19 b no_fetch_report
 mutate "a failed build that does not fail the job" 19 t failed_build_passes
 mutate "the run version cap removed" 19 t no_run_cap
 mutate "NOTICE dropped from the upload loop" 20 t no_notice_upload
-mutate "a job timeout over six hours" 21 t long_timeout
+mutate "an artifact name that is not the tag" 20 t other_artifact
+mutate "a build job timeout over an hour" 21 t long_timeout
 mutate "a build step timeout within 30 minutes of the job timeout" 21 t close_step_timeout
-mutate "a page cap that does not fit the build step" 21 t big_page_cap
 mutate "fail-fast: true" 22 t fail_fast
 mutate "max_parallel not bounded to 6" 22 t wide_parallel
 mutate "a matrix not from the plan output" 22 t other_matrix
@@ -442,63 +448,27 @@ calls() { cat "$TMP/curl.log" 2>/dev/null; }
 reset() { rm -f "$TMP/curl.log"; }
 
 vs=""
-for v in 0.9.0 1.0.0 1.1.0 1.1.1 1.2.0 1.3.0-beta1 1.10.0 2.0.0 2.0.1 v2.1.0; do vs="$vs{\"version\":\"$v\"},"; done
-echo "{\"versions\":[${vs%,}]}" > "$FIX/v1_providers_hashicorp_demo_versions.json"
-doc() { # id, title, slug, category, language
-  printf '{"id":"%s","title":"%s","slug":"%s","category":"%s","language":"%s"}' "$@"
-}
-page() { # id, category, content -> the v2 document
-  jq -n --arg id "$1" --arg c "$2" --arg t "$3" '{ data: { id: $id, type: "provider-docs", attributes: { category: $c, language: "hcl", content: $t } } }' > "$FIX/v2_provider-docs_$1.json"
-}
-{
-  printf '{"docs":['
-  doc 101 alpha alpha resources hcl; printf ,
-  doc 102 beta beta resources hcl; printf ,
-  doc 201 gamma gamma data-sources hcl; printf ,
-  doc 103 alpha alpha resources python; printf ,
-  doc 104 overview index overview hcl; printf ,
-  doc 301 ../evil ../evil resources hcl; printf ,
-  doc 302 a/b a/b resources hcl; printf ,
-  doc 303 Upper Upper resources hcl; printf ,
-  doc 304 x.md x.md data-sources hcl; printf ,
-  doc 305 'link\n..\/..\/x' 'link\n..\/..\/x' resources hcl; printf ,
-  doc 306 dup dup resources hcl; printf ,
-  doc 307 dup dup resources hcl; printf ,
-  doc 12a bad bad resources hcl; printf ,
-  doc 308 other mismatch resources hcl; printf ,
-  doc 105 delta delta resources hcl; printf ,
-  doc 309 delta delta_v2 resources hcl; printf ,
-  doc 106 delta delta resources python
-  printf ']}\n'
-} > "$FIX/v1_providers_hashicorp_demo_2.0.1.json"
-jq -e . "$FIX/v1_providers_hashicorp_demo_2.0.1.json" > /dev/null || { echo "FAIL the fixture does not parse"; exit 1; }
-page 101 resources $'# alpha\n'
-page 102 resources $'# beta\n'
-page 201 data-sources $'# gamma\n'
-# 105 is valid on its own, but 309 shares its title, so the warm workflow could not look it
-# up: neither is kept. 106 shares it too, in another language, which does not count.
-for id in 301 302 303 304 305 306 307 308 105 309; do page "$id" resources hostile; done
-# 1.2.0: the second page comes back with another id, so the version must not be built.
-printf '{"docs":[%s,%s]}\n' "$(doc 101 alpha alpha resources hcl)" "$(doc 999 zeta zeta resources hcl)" > "$FIX/v1_providers_hashicorp_demo_1.2.0.json"
-jq -n '{ data: { id: "998", attributes: { category: "resources", language: "hcl", content: "x" } } }' > "$FIX/v2_provider-docs_999.json"
-
+for v in 0.9.0 1.0.0 1.1.0 1.1.1 1.2.0 1.3.0-beta1 1.10.0 2.0.0 2.0.1 v2.1.0; do vs="$vs{\"version\":\"$v\",\"protocols\":[\"5.0\"]},"; done
+# Protocol 4 only (Terraform 0.11): left out. 4 and 5, or 6 alone: kept.
+vs="$vs{\"version\":\"0.1.0\",\"protocols\":[\"4.0\"]},{\"version\":\"0.2.0\",\"protocols\":[\"4\"]},{\"version\":\"0.8.0\",\"protocols\":[\"4.0\",\"5.0\"]},{\"version\":\"3.0.0\",\"protocols\":[\"6.0\"]},{\"version\":\"0.3.0\"}"
+echo "{\"versions\":[$vs]}" > "$FIX/v1_providers_hashicorp_demo_versions.json"
 : > "$TMP/tags0"
 printf '%s\n' hashicorp_demo-v2.0.0 hashicorp_demo-v1.1.0 hashicorp_other-v1.0.0 hashicorp_demo-v1.2 > "$TMP/tags1"
 reset
 sel="$("$BUILD" select hashicorp/demo "$TMP/tags0" | tr '\n' ' ')"
-check "select: every stable version, newest first, pre-releases and v-prefixed left out" "$([ "$sel" = "2.0.1 2.0.0 1.10.0 1.2.0 1.1.1 1.1.0 1.0.0 0.9.0 " ]; echo $?)"
+check "select: every stable protocol 5 or 6 version, newest first; pre-releases, v-prefixed and protocol 4 only left out" "$([ "$sel" = "3.0.0 2.0.1 2.0.0 1.10.0 1.2.0 1.1.1 1.1.0 1.0.0 0.9.0 0.8.0 " ]; echo $?)"
 sel="$("$BUILD" select hashicorp/demo "$TMP/tags1" | tr '\n' ' ')"
-check "select: a version whose tag exists is skipped, and only that provider's exact tag counts" "$([ "$sel" = "2.0.1 1.10.0 1.2.0 1.1.1 1.0.0 0.9.0 " ]; echo $?)"
+check "select: a version whose tag exists is skipped, and only that provider's exact tag counts" "$([ "$sel" = "3.0.0 2.0.1 1.10.0 1.2.0 1.1.1 1.0.0 0.9.0 0.8.0 " ]; echo $?)"
 sel="$("$BUILD" select hashicorp/demo "$TMP/tags0" '>=1.2.0' | tr '\n' ' ')"
-check "select: a minimum is inclusive and compares numerically" "$([ "$sel" = "2.0.1 2.0.0 1.10.0 1.2.0 " ]; echo $?)"
+check "select: a minimum is inclusive and compares numerically" "$([ "$sel" = "3.0.0 2.0.1 2.0.0 1.10.0 1.2.0 " ]; echo $?)"
 sel="$("$BUILD" select hashicorp/demo "$TMP/tags1" '>=1.1.1' | tr '\n' ' ')"
-check "select: a minimum and published tags together" "$([ "$sel" = "2.0.1 1.10.0 1.2.0 1.1.1 " ]; echo $?)"
+check "select: a minimum and published tags together" "$([ "$sel" = "3.0.0 2.0.1 1.10.0 1.2.0 1.1.1 " ]; echo $?)"
 sel="$("$BUILD" select hashicorp/demo "$TMP/tags0" '>=9.0.0')"
 check "select: a minimum above every version selects nothing and succeeds" "$(rc=$?; [ "$rc" = 0 ] && [ -z "$sel" ]; echo $?)"
 sel="$("$BUILD" select hashicorp/demo "$TMP/tags0" '>=1.0.0' '!2.0.0' '!1.2.0' '!9.9.9' | tr '\n' ' ')"
-check "select: versions to skip are dropped after the minimum" "$([ "$sel" = "2.0.1 1.10.0 1.1.1 1.1.0 1.0.0 " ]; echo $?)"
+check "select: versions to skip are dropped after the minimum" "$([ "$sel" = "3.0.0 2.0.1 1.10.0 1.1.1 1.1.0 1.0.0 " ]; echo $?)"
 sel="$("$BUILD" select hashicorp/demo "$TMP/tags1" '!0.9.0' | tr '\n' ' ')"
-check "select: a version to skip without a minimum, with published tags" "$([ "$sel" = "2.0.1 1.10.0 1.2.0 1.1.1 1.0.0 " ]; echo $?)"
+check "select: a version to skip without a minimum, with published tags" "$([ "$sel" = "3.0.0 2.0.1 1.10.0 1.2.0 1.1.1 1.0.0 0.8.0 " ]; echo $?)"
 # One argument each; a space inside one is part of it.
 for bad in "1.0.0" ">=1.0" ">1.0.0" ">=1.0.0-beta1" "!1.0" "!v1.0.0" "!1.0.0-beta1" '!1.0.0;x' "!../x" "!" "!1.0.0 !2.0.0" ""; do
   reset
@@ -516,60 +486,84 @@ reset
 "$BUILD" select hashicorp/demo "$TMP/no-such-file" > /dev/null 2>&1
 check "select: refuses a missing tags file before any call" "$(rc=$?; [ "$rc" != 0 ] && [ -z "$(calls)" ]; echo $?)"
 
-reset
+# --- build.sh with terraform stubbed -----------------------------------------------------
+# The stub logs each call with the CLI config and checkpoint settings it sees, answers
+# version, init and providers schema from fixtures, and writes a lock file on init.
+# TF_STUB picks the case; TF_STUB_VERSION the version it reports.
+cat > "$TMP/bin/terraform" <<STUB
+#!/bin/bash
+echo "\$1 cfg=\${TF_CLI_CONFIG_FILE:-unset} cp=\${CHECKPOINT_DISABLE:-unset}" >> "$TMP/tf.log"
+case "\$1" in
+version) printf '{"terraform_version":"%s"}\n' "\${TF_STUB_VERSION:-1.16.4}" ;;
+init)
+  cp main.tf "$TMP/main.tf"
+  [ "\${TF_STUB:-ok}" = init-fails ] && exit 1
+  if [ "\${TF_STUB:-ok}" = no-hash ]; then
+    printf 'provider "registry.terraform.io/hashicorp/demo" {\n  hashes = [\n    "zh:0123abcd",\n  ]\n}\n' > .terraform.lock.hcl
+  else
+    printf 'provider "registry.terraform.io/hashicorp/demo" {\n  hashes = [\n    "h1:AAAA+/=",\n    "zh:0123abcd",\n  ]\n}\n' > .terraform.lock.hcl
+  fi ;;
+providers) cat "$FIX/schema-\${TF_STUB:-ok}.json" ;;
+*) exit 2 ;;
+esac
+STUB
+chmod +x "$TMP/bin/terraform"
+tfcalls() { cat "$TMP/tf.log" 2>/dev/null; }
+tfreset() { rm -f "$TMP/tf.log" "$TMP/main.tf"; }
+k=registry.terraform.io/hashicorp/demo
+jq -n --arg k "$k" '{ provider_schemas: { ($k): { resource_schemas: { demo_b: { version: 0 }, demo_a: { version: 1 } },
+  data_source_schemas: { demo_c: { version: 0 } }, functions: { f: {} }, provider: {} } }, format_version: "1.0" }' > "$FIX/schema-ok.json"
+cp "$FIX/schema-ok.json" "$FIX/schema-no-hash.json"
+jq -n '{ format_version: "1.0", provider_schemas: { "registry.terraform.io/hashicorp/other": { resource_schemas: { x: {} } } } }' > "$FIX/schema-wrong-key.json"
+jq -n --arg k "$k" '{ format_version: "1.0", provider_schemas: { ($k): { resource_schemas: { x: {} } },
+  "registry.terraform.io/hashicorp/other": { resource_schemas: { y: {} } } } }' > "$FIX/schema-two.json"
+jq -n --arg k "$k" '{ format_version: "1.0", provider_schemas: { ($k): { resource_schemas: {}, data_source_schemas: {} } } }' > "$FIX/schema-empty.json"
+printf '{"format_version":' > "$FIX/schema-broken.json"
+
+reset; tfreset
 o1="$TMP/out1"
 n="$("$BUILD" build hashicorp/demo 2.0.1 "$o1" 2> "$TMP/b1.err")"
-check "build: succeeds with 3 pages" "$([ "$n" = 3 ]; echo $?)"
-tb="$o1/hashicorp_demo-2.0.1.tar.gz"
-check "build: the output holds exactly the tar, manifest.json, NOTICE and SHA256SUMS" "$([ "$(ls "$o1" | tr '\n' ' ')" = "NOTICE SHA256SUMS hashicorp_demo-2.0.1.tar.gz manifest.json " ]; echo $?)"
+check "build: succeeds and prints 2 resources and 1 data source" "$([ "$n" = "2 1" ]; echo $?)"
+sf="$o1/hashicorp_demo-2.0.1.schema.json.gz"
+check "build: the output holds exactly the schema, manifest.json, NOTICE and SHA256SUMS" "$([ "$(LC_ALL=C ls "$o1" | tr '\n' ' ')" = "NOTICE SHA256SUMS hashicorp_demo-2.0.1.schema.json.gz manifest.json " ]; echo $?)"
+check "build: main.tf requires exactly one provider at exactly the version" "$(grep -qxF '      source  = "hashicorp/demo"' "$TMP/main.tf" \
+  && grep -qxF '      version = "= 2.0.1"' "$TMP/main.tf" && [ "$(grep -c 'source' "$TMP/main.tf")" = 1 ]; echo $?)"
+check "build: terraform runs with no CLI config file and the checkpoint off" "$([ "$(tfcalls | wc -l)" = 3 ] && [ -z "$(tfcalls | grep -v ' cfg=/dev/null cp=1$')" ]; echo $?)"
+check "build: no registry call" "$([ -z "$(calls)" ]; echo $?)"
+check "build: the schema is the fixture with sorted keys, compact" "$([ "$(gzip -dc "$sf")" = "$(jq -S -c . "$FIX/schema-ok.json")" ]; echo $?)"
+check "build: the gzip header holds no name and no time" "$([ "$(od -An -tx1 -j3 -N5 "$sf" | tr -d ' \n')" = 0000000000 ]; echo $?)"
+check "build: SHA256SUMS covers the schema, the manifest and NOTICE and verifies" "$(cd "$o1" && [ "$(awk '{ print $2 }' SHA256SUMS | tr '\n' ' ')" = "hashicorp_demo-2.0.1.schema.json.gz manifest.json NOTICE " ] && sha256sum --strict --quiet -c SHA256SUMS; echo $?)"
 check "build: NOTICE names the license, its URL and the registry source" "$(grep -qF 'Mozilla Public' "$o1/NOTICE" && grep -qF 'https://mozilla.org/MPL/2.0/' "$o1/NOTICE" \
   && grep -qxF 'https://registry.terraform.io/v1/providers/hashicorp/demo/2.0.1' "$o1/NOTICE"; echo $?)"
-check "build: registry calls carry the mirror's User-Agent" "$(grep -qxF 'ua provider-schema-mirror' "$TMP/ua.log" && [ "$(sort -u "$TMP/ua.log" | wc -l)" = 1 ]; echo $?)"
-check "build: the tar holds the three pages at their page paths" "$([ "$(tar -tzf "$tb" | tr '\n' ' ')" = "hashicorp/demo/2.0.1/data-sources/gamma.md hashicorp/demo/2.0.1/resources/alpha.md hashicorp/demo/2.0.1/resources/beta.md " ]; echo $?)"
-check "build: every tar entry is a regular file owned by 0/0 at mtime 0" "$([ -z "$(tar -tvzf "$tb" | grep -vE '^-rw-r--r-- 0/0 +[0-9]+ 1970-01-01 00:00 ')" ]; echo $?)"
-check "build: a page holds the document content" "$([ "$(tar -xOzf "$tb" hashicorp/demo/2.0.1/resources/alpha.md)" = "# alpha" ]; echo $?)"
-check "build: SHA256SUMS covers the tar, the manifest and NOTICE and verifies" "$(cd "$o1" && [ "$(awk '{ print $2 }' SHA256SUMS | tr '\n' ' ')" = "hashicorp_demo-2.0.1.tar.gz manifest.json NOTICE " ] && sha256sum --strict --quiet -c SHA256SUMS; echo $?)"
-check "build: the manifest names the provider, version, pages, ids and source" "$(jq -e '.format == 1 and .provider == "hashicorp/demo" and .version == "2.0.1" and .pages == 3
-  and ([.docs[].id] | sort) == ["101", "102", "201"] and .tarball == "hashicorp_demo-2.0.1.tar.gz" and .license == "MPL-2.0"
+check "build: the manifest names the provider, version, counts, hashes and source" "$(jq -e '.format == 2 and .provider == "hashicorp/demo" and .version == "2.0.1"
+  and .file == "hashicorp_demo-2.0.1.schema.json.gz" and .resources == 2 and .data_sources == 1 and .ephemeral_resources == 0 and .functions == 1
+  and .terraform_version == "1.16.4" and .format_version == "1.0" and .provider_hashes == ["h1:AAAA+/=", "zh:0123abcd"] and .license == "MPL-2.0"
   and .source == "https://registry.terraform.io/v1/providers/hashicorp/demo/2.0.1" and (.built_at | test("^[0-9-]{10}T[0-9:]{8}Z$"))' "$o1/manifest.json" > /dev/null; echo $?)"
-check "build: hostile, duplicate, mismatched and same-title documents are never fetched" "$([ -z "$(calls | grep -E 'provider-docs/(30[1-9]|12a|105)')" ]; echo $?)"
-check "build: only the three pages are fetched, over HTTPS from the registry" "$([ "$(calls | grep -c 'provider-docs/')" = 3 ] && [ -z "$(calls | grep -E '^(no-proto|other-host)')" ]; echo $?)"
-check "build: the eleven skipped documents are reported" "$(grep -q ': 11 documents skipped' "$TMP/b1.err"; echo $?)"
-check "build: nothing is written outside the output directory" "$([ ! -e "$TMP/evil" ] && [ ! -e "$TMP/x" ] && [ ! -e "$TMP/out1/../evil.md" ]; echo $?)"
 "$BUILD" build hashicorp/demo 2.0.1 "$TMP/out2" > /dev/null 2>&1
-check "build: the same pages give the same tar" "$(cmp -s "$tb" "$TMP/out2/hashicorp_demo-2.0.1.tar.gz"; echo $?)"
+check "build: the same schema gives the same bytes" "$(cmp -s "$sf" "$TMP/out2/hashicorp_demo-2.0.1.schema.json.gz"; echo $?)"
 
-reset
-n="$("$BUILD" build hashicorp/demo 1.2.0 "$TMP/out3" 2> "$TMP/b3.err")"
-check "build: a page that fails its checks fails the version and writes nothing" "$(rc=$?; [ "$rc" != 0 ] && [ ! -e "$TMP/out3" ]; echo $?)"
-check "build: a failed build still reports the 2 pages it fetched" "$([ "$n" = 2 ]; echo $?)"
-# 1.1.1: the third page's fetch itself fails (the stub has no document 777).
-printf '{"docs":[%s,%s,%s]}\n' "$(doc 101 alpha alpha resources hcl)" "$(doc 102 beta beta resources hcl)" "$(doc 777 eta eta resources hcl)" \
-  > "$FIX/v1_providers_hashicorp_demo_1.1.1.json"
-reset
-n="$("$BUILD" build hashicorp/demo 1.1.1 "$TMP/out6" 2> /dev/null)"
-check "build: a failed page fetch fails the version and writes nothing" "$(rc=$?; [ "$rc" != 0 ] && [ ! -e "$TMP/out6" ]; echo $?)"
-check "build: a failed fetch still reports the 3 fetches made, the failed one included" "$([ "$n" = 3 ] && [ "$(calls | grep -c 'provider-docs/')" = 3 ]; echo $?)"
-reset
-n="$(MIRROR_MAX_PAGES=2 "$BUILD" build hashicorp/demo 2.0.1 "$TMP/out4" 2> /dev/null)"
-check "build: a version over the page cap is not built and no page is fetched" "$(rc=$?; [ "$rc" != 0 ] && [ ! -e "$TMP/out4" ] && [ -z "$(calls | grep provider-docs)" ] && [ "$n" = 0 ]; echo $?)"
-"$BUILD" build hashicorp/demo 3.0.0 "$TMP/out5" > /dev/null 2>&1
-check "build: a version with no document list is not built" "$(rc=$?; [ "$rc" != 0 ] && [ ! -e "$TMP/out5" ]; echo $?)"
+for c in init-fails wrong-key two empty broken no-hash; do
+  TF_STUB="$c" "$BUILD" build hashicorp/demo 2.0.1 "$TMP/out-$c" > /dev/null 2>&1
+  check "build: case $c fails the version and writes nothing" "$(rc=$?; [ "$rc" != 0 ] && [ ! -e "$TMP/out-$c" ]; echo $?)"
+done
+tfreset
+TF_STUB_VERSION=1.17.0-beta1 "$BUILD" build hashicorp/demo 2.0.1 "$TMP/out-beta" > /dev/null 2>&1
+check "build: a terraform that is not a stable release is refused before init" "$(rc=$?; [ "$rc" != 0 ] && [ ! -e "$TMP/out-beta" ] && [ -z "$(tfcalls | grep '^init')" ]; echo $?)"
 
 mkdir "$TMP/elsewhere"
 ln -s "$TMP/elsewhere" "$TMP/linkout"
-reset
+tfreset
 "$BUILD" build hashicorp/demo 2.0.1 "$TMP/linkout" > /dev/null 2>&1
-check "build: a symbolic link as the output directory is refused" "$(rc=$?; [ "$rc" != 0 ] && [ -z "$(ls -A "$TMP/elsewhere")" ] && [ -z "$(calls)" ]; echo $?)"
+check "build: a symbolic link as the output directory is refused" "$(rc=$?; [ "$rc" != 0 ] && [ -z "$(ls -A "$TMP/elsewhere")" ] && [ -z "$(tfcalls)" ]; echo $?)"
 "$BUILD" build hashicorp/demo 2.0.1 "$o1" > /dev/null 2>&1
 check "build: an existing output directory is refused" "$([ $? != 0 ]; echo $?)"
 
 for bad in "../demo 2.0.1" "hashicorp/../demo 2.0.1" "Hashicorp/demo 2.0.1" "hashicorp/demo/x 2.0.1" "hashicorp 2.0.1" \
-  "hashicorp/demo 2.0.1/../../x" "hashicorp/demo 2.0.1-beta1" "hashicorp/demo v2.0.1"; do
-  reset
+  "hashicorp/demo 2.0.1/../../x" "hashicorp/demo 2.0.1-beta1" "hashicorp/demo v2.0.1" 'hashicorp/demo 2.0.1"' ; do
+  tfreset
   read -r pr ver <<< "$bad"
   "$BUILD" build "$pr" "$ver" "$TMP/out-hostile" > /dev/null 2>&1
-  check "build: refuses the hostile argument '$bad' before any call" "$(rc=$?; [ "$rc" != 0 ] && [ ! -e "$TMP/out-hostile" ] && [ -z "$(calls)" ]; echo $?)"
+  check "build: refuses the hostile argument '$bad' before any terraform call" "$(rc=$?; [ "$rc" != 0 ] && [ ! -e "$TMP/out-hostile" ] && [ -z "$(tfcalls)" ]; echo $?)"
 done
 reset
 "$BUILD" select ../demo "$TMP/tags0" > /dev/null 2>&1

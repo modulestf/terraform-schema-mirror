@@ -4,20 +4,23 @@
 # stay the same. This repository must stay public: consumers download its release assets
 # anonymously.
 #
-# It publishes one release per provider version: a tar.gz of every resource and data
-# source page from the Terraform registry, manifest.json, NOTICE and SHA256SUMS. Every
+# It publishes one release per provider version: the provider schema from terraform
+# providers schema -json as gzipped JSON, manifest.json, NOTICE and SHA256SUMS. Every
 # stable version of each provider in ci/mirror/providers.txt is published, newest first,
-# optionally from a minimum version up. A version whose tag exists is skipped: pages at a
-# version never change, so a release is built once and never rebuilt. A version with any
-# failed page is not published this run; the next run retries it. How it works and why:
-# README.md.
+# optionally from a minimum version up. A version whose tag exists is skipped: a provider
+# release never changes, so a release here is built once and never rebuilt. A version
+# whose build fails is not published this run; the next run retries it. How it works and
+# why: README.md.
 #
-# Two jobs. plan holds contents: read and no token beyond the checkout's: it lists the
-# existing tags anonymously, picks the versions to build and hands them to build as a
-# matrix. build runs one job per version, at most max_parallel at a time, and holds
-# contents: write to create releases. Neither holds a secret beyond GITHUB_TOKEN, an
-# id-token, a cloud credential or a model. Each checkout step receives the token to clone
-# and does not persist it; after that only the publish step gets it.
+# Three jobs. plan holds contents: read and no token beyond the checkout's: it lists the
+# existing tags anonymously, picks the versions to build and hands them on as a matrix.
+# build runs one job per version, at most max_parallel at a time: it installs the provider
+# with terraform init, reads its schema and uploads the bundle as an artifact. It runs
+# downloaded provider code, so it holds contents: read only and no token. publish, the same
+# matrix, downloads each bundle and holds contents: write to create the release. No job
+# holds a secret beyond GITHUB_TOKEN, an id-token, a cloud credential or a model. Each
+# checkout step receives the token to clone and does not persist it; after that only the
+# publish step gets it.
 #
 # It runs only on schedule and workflow_dispatch, only on the default branch.
 #
@@ -33,7 +36,7 @@ on:
       max_versions:
         description: 'The most versions one run builds, over all providers (1-250)'
         required: false
-        default: '40'
+        default: '250'
       max_parallel:
         description: 'The most versions built at the same time (1-6)'
         required: false
@@ -60,7 +63,7 @@ jobs:
       count: ${{ steps.plan.outputs.count }}
       max_parallel: ${{ steps.plan.outputs.max_parallel }}
     env:
-      MAX_VERSIONS: ${{ inputs.max_versions || '40' }}
+      MAX_VERSIONS: ${{ inputs.max_versions || '250' }}
       MAX_PARALLEL: ${{ inputs.max_parallel || '3' }}
       MIRROR_DELAY: '0.5'
       MIRROR_USER_AGENT: provider-schema-mirror (github.com/${{ github.repository }})
@@ -115,17 +118,17 @@ jobs:
             echo "max_parallel=$MAX_PARALLEL"
           } >> "$GITHUB_OUTPUT"
 
+  # Runs the downloaded provider to read its schema, so it holds no write access and no
+  # token; the bundle goes to publish as an artifact.
   build:
     needs: plan
     if: needs.plan.outputs.count != '0'
     runs-on: ubuntu-24.04
-    # One version per job. About 0.8 s per page at MIRROR_DELAY 0.5, so a version at the
-    # MIRROR_MAX_PAGES cap takes about 70 minutes; the build step's own timeout stops a
-    # slow build and leaves time to publish before this job timeout, which stays under the
-    # six-hour job limit. [verify]
-    timeout-minutes: 240
+    # One version per job: terraform init downloads the provider, then the schema is read
+    # from it. Well under a minute for hashicorp/aws.
+    timeout-minutes: 30
     permissions:
-      contents: write
+      contents: read
     strategy:
       # One failed version never cancels the others.
       fail-fast: false
@@ -137,23 +140,22 @@ jobs:
       MATRIX_PROVIDER: ${{ matrix.provider }}
       MATRIX_VERSION: ${{ matrix.version }}
       MATRIX_TAG: ${{ matrix.tag }}
-      # Seconds between registry calls; one call at a time in each job.
-      MIRROR_DELAY: '0.5'
-      # The most pages one version may have; a version with more is not built. A run
-      # fetches at most max_versions times this many pages.
-      MIRROR_MAX_PAGES: '5000'
-      # Sent to the registry with every call, so its operators can tell who reads in bulk.
-      MIRROR_USER_AGENT: provider-schema-mirror (github.com/${{ github.repository }})
     steps:
       - name: Check out the default branch
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
 
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.16.4
+          terraform_wrapper: false
+
       # No token in this step. build.sh writes the version's directory only when the whole
-      # build succeeded, and prints the pages it fetched, on failure too.
+      # build succeeded.
       - name: Build the bundle
-        timeout-minutes: 180
+        timeout-minutes: 20
         run: |
           set -uo pipefail
           set -f
@@ -161,17 +163,48 @@ jobs:
           [[ "$pr" =~ ^[a-z0-9][a-z0-9-]{0,63}/[a-z0-9][a-z0-9-]{0,63}$ && "$ver" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ && "$tag" == "${pr/\//_}-v$ver" ]] || { echo "::error::the matrix entry is not a provider, a stable version and its tag"; exit 1; }
           out="$RUNNER_TEMP/mirror-out"
           mkdir "$out" || exit 1
-          pages="$(ci/mirror/build.sh build "$pr" "$ver" "$out/$tag")"
-          rc=$?
-          [[ "$pages" =~ ^[0-9]{1,6}$ ]] || pages=0
-          if [ "$rc" = 0 ]; then
-            echo "built $tag: $pages pages"
+          if counts="$(ci/mirror/build.sh build "$pr" "$ver" "$out/$tag")"; then
+            echo "built $tag: $counts (resources, data sources)"
           else
-            echo "::error::$tag was not built after $pages page fetches; the next run retries it"
+            echo "::error::$tag was not built; the next run retries it"
             exit 1
           fi
 
-      # The release is created as a draft, its assets uploaded, and only then published,
+      - name: Upload the bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.MATRIX_TAG }}
+          path: ${{ runner.temp }}/mirror-out/${{ env.MATRIX_TAG }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # The only job with write access. It runs no downloaded code and no build.sh: it
+  # downloads the bundle and publishes it.
+  publish:
+    needs: [plan, build]
+    if: ${{ !cancelled() && needs.plan.outputs.count != '0' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      MATRIX_PROVIDER: ${{ matrix.provider }}
+      MATRIX_VERSION: ${{ matrix.version }}
+      MATRIX_TAG: ${{ matrix.tag }}
+    steps:
+      - name: Download the bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.MATRIX_TAG }}
+          path: ${{ runner.temp }}/mirror-out/${{ env.MATRIX_TAG }}
+
+      # The bundle is the one the build job uploaded; a failed build uploaded none, so its
+      # download fails and so does this job. The release is created as a draft, its assets uploaded, and only then published,
       # which creates the tag. A release whose upload or publish fails is deleted while it
       # is still a draft, so a partial release is never visible. REST only, with the job's
       # GITHUB_TOKEN.
@@ -184,21 +217,21 @@ jobs:
           pr="$MATRIX_PROVIDER" ver="$MATRIX_VERSION" tag="$MATRIX_TAG"
           [[ "$pr" =~ ^[a-z0-9][a-z0-9-]{0,63}/[a-z0-9][a-z0-9-]{0,63}$ && "$ver" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ && "$tag" == "${pr/\//_}-v$ver" ]] || { echo "::error::the matrix entry is not a provider, a stable version and its tag"; exit 1; }
           d="$RUNNER_TEMP/mirror-out/$tag"
-          tarball="${pr/\//_}-$ver.tar.gz"
+          file="${pr/\//_}-$ver.schema.json.gz"
           (cd "$d" && sha256sum --strict --quiet -c SHA256SUMS) || { echo "::error::$tag: checksums do not match"; exit 1; }
           body="$(printf '%s\n' \
-            "Documentation pages of the Terraform provider $pr, version $ver, as served by the Terraform registry:" \
-            "https://registry.terraform.io/v1/providers/$pr/$ver" \
+            "Schema of the Terraform provider $pr, version $ver, from terraform providers schema -json." \
+            "Provider release: https://registry.terraform.io/v1/providers/$pr/$ver" \
             "" \
-            "The provider documentation is licensed by its authors under the Mozilla Public License 2.0 (MPL-2.0):" \
-            "https://mozilla.org/MPL/2.0/. The pages are unmodified; the source is the provider's own repository." \
+            "The provider is licensed by its authors under the Mozilla Public License 2.0 (MPL-2.0):" \
+            "https://mozilla.org/MPL/2.0/. Its source is the provider's own repository." \
             "" \
-            "Assets: $tarball (the pages), manifest.json, NOTICE, SHA256SUMS. See README.md.")"
+            "Assets: $file (the schema, gzipped JSON), manifest.json, NOTICE, SHA256SUMS. See README.md.")"
           id="$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$tag" -f target_commitish="$GITHUB_SHA" \
             -f name="$pr $ver" -f body="$body" -F draft=true -f make_latest=false --jq .id)" \
             && [[ "$id" =~ ^[0-9]+$ ]] || { echo "::error::$tag: cannot create the draft release"; exit 1; }
           ok=1
-          for f in "$tarball" manifest.json NOTICE SHA256SUMS; do
+          for f in "$file" manifest.json NOTICE SHA256SUMS; do
             # [verify] gh api accepts the absolute uploads URL
             gh api -X POST "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$id/assets?name=$f" \
               -H 'Content-Type: application/octet-stream' --input "$d/$f" > /dev/null || { ok=0; break; }

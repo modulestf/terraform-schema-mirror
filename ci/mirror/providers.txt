@@ -25,5 +25,6 @@ hashicorp/time
 hashicorp/http
 hashicorp/cloudinit
 hashicorp/helm
-hashicorp/kubernetes
+# 2.37.0 does not implement GetResourceIdentitySchemas, so current terraform cannot read its schema.
+hashicorp/kubernetes !2.37.0
 kreuzwerker/docker

@@ -106,7 +106,7 @@ jobs:
               printf '%s %s %s %s %s\n' "$rank" "$idx" "$tag" "$pr" "$ver" >> "$planned"
             done
           done < ci/mirror/providers.txt
-          sort -s -n -k1,1 -k2,2 "$planned" | cut -d' ' -f3- | head -n "$MAX_VERSIONS" > "$planned.run"
+          sort -s -n -k1,1 -k2,2 "$planned" | cut -d' ' -f3- | awk -v n="$MAX_VERSIONS" 'NR <= n' > "$planned.run"
           echo "versions to publish: $(wc -l < "$planned"); this run builds $(wc -l < "$planned.run")"
           {
             printf 'matrix='

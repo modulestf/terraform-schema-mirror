@@ -193,7 +193,7 @@ run_checks() { # workflow, build script, providers file, README -> ok or FAIL li
     printf '%s\n' "$bs" | grep -A1 -F 'echo "::error::$tag was not built after' | tail -n 1 | grep -qxE ' +exit 1' || echo "a failed build does not fail the job"
     printf '%s\n' "$bj" | grep -qE "^      MIRROR_MAX_PAGES: *'?[0-9]+'? *$" || echo "no page cap in the build job"
     ps="$(printf '%s\n' "$pj" | step '^      - name: Plan')"
-    printf '%s\n' "$ps" | grep -qE '\| head -n "\$MAX_VERSIONS" > "\$planned\.run"$' || echo "the versions of a run are not capped"
+    printf '%s\n' "$ps" | grep -qE "\\| awk -v n=\"\\\$MAX_VERSIONS\" 'NR <= n' > \"\\\$planned\\.run\"\$" || echo "the versions of a run are not capped"
     printf '%s\n' "$ps" | grep -E '^ +jq ' | grep -qE '"\$planned\.run"$' || echo "the matrix is not the capped list")"
 
   r 20 "the publish step uploads exactly the files build.sh writes" "$(
@@ -239,11 +239,14 @@ run_checks() { # workflow, build script, providers file, README -> ok or FAIL li
     printf '%s\n' "$ps" | grep -qxF '              printf '"'"'%s %s %s %s %s\n'"'"' "$rank" "$idx" "$tag" "$pr" "$ver" >> "$planned"' || echo "a planned line is not rank, provider index, tag, provider, version"
     sl="$(printf '%s\n' "$ps" | grep -E '^ +sort .*"\$planned\.run"$' | sed 's/^ *//')"
     [ -n "$sl" ] || echo "no sort of the planned list"
-    # Run the template's own line on a fixture: provider 1 has four versions, provider 2 two.
+    # Run the template's own line on a fixture: provider 1 has four versions, provider 2 two,
+    # provider 3 many more ranked past the cap. Under pipefail, as in the step, a cap that stops
+    # reading early (head) breaks the pipe of the writer before it and fails the plan.
     d="$(mktemp -d "$TMP/il.XXXXXX")"
     printf '%s\n' "1 1 a-v4 a 4" "2 1 a-v3 a 3" "3 1 a-v2 a 2" "4 1 a-v1 a 1" "1 2 b-v2 b 2" "2 2 b-v1 b 1" > "$d/p"
-    got="$(cd "$d" && planned="$d/p" MAX_VERSIONS=5 bash -c "$sl" 2>&1 && tr '\n' ' ' < "$d/p.run")"
-    [ "$got" = "a-v4 a 4 b-v2 b 2 a-v3 a 3 b-v1 b 1 a-v2 a 2 " ] || echo "interleaved and capped at 5: $got")"
+    seq 20000 | awk '{ print 99, 3, "z-v" $1, "z", $1 }' >> "$d/p"
+    got="$(cd "$d" && planned="$d/p" MAX_VERSIONS=5 bash -o pipefail -c "$sl" 2>&1 && tr '\n' ' ' < "$d/p.run")"
+    [ "$got" = "a-v4 a 4 b-v2 b 2 a-v3 a 3 b-v1 b 1 a-v2 a 2 " ] || echo "interleaved and capped at 5: ${got:0:200}")"
 
   r 25 "select drops the versions to skip and refuses a malformed one" "$(
     printf '%s\n' "$b" | grep -qF 'index(skip, " " $0 " ") { next }' || echo "select does not drop a skipped version"
@@ -331,7 +334,7 @@ no_needs() { grep -vxF '    needs: plan'; }
 # shellcheck disable=SC2016 # workflow text, not shell
 token_in_plan() { awk '/^      - name: Plan/ { print; print "        env:"; print "          GH_TOKEN: ${{ github.token }}"; next } { print }'; }
 failed_build_passes() { awk '/::error::\$tag was not built after/ { print; getline; next } { print }'; }
-no_run_cap() { sed 's/ | head -n "\$MAX_VERSIONS"//'; }
+no_run_cap() { sed "s/ | awk -v n=\"\\\$MAX_VERSIONS\" 'NR <= n'//"; }
 fail_fast() { sed 's/fail-fast: false/fail-fast: true/'; }
 wide_parallel() { sed 's/"\$MAX_PARALLEL" =~ ^\[1-6\]\$/"$MAX_PARALLEL" =~ ^[0-9]+$/'; }
 # shellcheck disable=SC2016 # workflow text, not shell

@@ -21,7 +21,7 @@ No token and no GitHub API call, only HTTPS:
 ```sh
 tag=hashicorp_aws-v6.0.0
 file=hashicorp_aws-6.0.0.schema.json.gz
-base="https://github.com/pofix/terraform-schema-mirror/releases/download/$tag"
+base="https://github.com/modulestf/terraform-schema-mirror/releases/download/$tag"
 
 for f in "$file" manifest.json NOTICE SHA256SUMS; do
   curl -fsSL --proto '=https' -o "$f" "$base/$f" || exit 1
